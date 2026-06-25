@@ -180,6 +180,8 @@ export default function App() {
   const [activeReportTab, setActiveReportTab] = useState<"students" | "attendance" | "financials">("students");
   const [reportAttendanceData, setReportAttendanceData] = useState<any>(null);
   const [isReportLoading, setIsReportLoading] = useState<boolean>(false);
+  const [reportSelectedClass, setReportSelectedClass] = useState<string>("All");
+  const [reportSelectedStudentId, setReportSelectedStudentId] = useState<string>("All");
 
   // Toast System
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -803,9 +805,75 @@ export default function App() {
   };
 
   const triggerPdfGeneration = async () => {
+    // 1. INDIVIDUAL STUDENT REPORT
+    if (reportSelectedStudentId !== "All") {
+      const student = students.find(s => s.id === reportSelectedStudentId);
+      if (!student) {
+        showToast("Ardayga la doortay lama helin!", "error");
+        return;
+      }
+
+      // Load attendance data if not present
+      let attData = reportAttendanceData;
+      if (!attData) {
+        setIsReportLoading(true);
+        try {
+          const res = await apiFetch("/api/attendance/all");
+          attData = await res.json();
+          setReportAttendanceData(attData);
+        } catch (err) {
+          showToast("Ku guuldareystay soo celinta xogta maqnaanshaha", "error");
+          setIsReportLoading(false);
+          return;
+        } finally {
+          setIsReportLoading(false);
+        }
+      }
+
+      // Compile individual student attendance
+      const studentAttendance: { date: string; status: string }[] = [];
+      if (attData) {
+        Object.keys(attData).sort().reverse().forEach(date => {
+          const list = attData[date] || [];
+          const matched = list.find((a: any) => a.studentId === student.id);
+          if (matched) {
+            studentAttendance.push({ date, status: matched.status });
+          }
+        });
+      }
+
+      const totalSessions = studentAttendance.length;
+      const presentCount = studentAttendance.filter(a => a.status === "Present").length;
+      const lateCount = studentAttendance.filter(a => a.status === "Late").length;
+      const absentCount = studentAttendance.filter(a => a.status === "Absent").length;
+      const attendanceRate = totalSessions > 0 ? Math.round(((presentCount + lateCount) / totalSessions) * 100) : 100;
+
+      // Compile individual student fees
+      const studentFees = fees[student.id] || [];
+      const totalExpected = studentFees.reduce((sum, f) => sum + Number(f.amount), 0);
+      const totalPaid = studentFees.reduce((sum, f) => sum + Number(f.paidAmount), 0);
+      const outstanding = totalExpected - totalPaid;
+
+      const stats = [
+        { label: "Attendance Rate", value: `${attendanceRate}%` },
+        { label: "Total Billed", value: `${settings.currency} ${totalExpected.toLocaleString()}` },
+        { label: "Total Paid", value: `${settings.currency} ${totalPaid.toLocaleString()}` },
+        { label: "Balance Due", value: `${settings.currency} ${outstanding.toLocaleString()}` }
+      ];
+
+      printStudentReportCardHTML(student, studentAttendance, studentFees, attendanceRate, stats);
+      return;
+    }
+
+    // 2. CLASS FILTERED OR GENERAL REPORTS
+    const isClassFiltered = reportSelectedClass !== "All";
+    const filteredClassStudents = isClassFiltered 
+      ? students.filter(s => s.class === reportSelectedClass)
+      : students;
+
     if (activeReportTab === "students") {
       const cols = ["Student ID", "Full Name", "Class / Grade", "Gender", "Guardian Phone", "Status"];
-      const rows = students.map(s => [
+      const rows = filteredClassStudents.map(s => [
         s.id.substring(0, 8).toUpperCase(),
         s.fullName,
         s.class || "Not Assigned",
@@ -814,11 +882,15 @@ export default function App() {
         s.status.toUpperCase()
       ]);
       const stats = [
-        { label: "Total Students", value: students.length.toString() },
-        { label: "Active Enrolled", value: students.filter(s => s.status === 'active').length.toString() },
-        { label: "Male Students", value: students.filter(s => s.gender?.toLowerCase() === 'male' || s.gender?.toLowerCase() === 'boy' || s.gender?.toLowerCase() === 'lab').length.toString() }
+        { label: "Total Students", value: filteredClassStudents.length.toString() },
+        { label: "Active Enrolled", value: filteredClassStudents.filter(s => s.status === 'active').length.toString() },
+        { label: "Male Students", value: filteredClassStudents.filter(s => s.gender?.toLowerCase() === 'male' || s.gender?.toLowerCase() === 'boy' || s.gender?.toLowerCase() === 'lab').length.toString() }
       ];
-      printReportHTML("STUDENTS ROSTER DIRECTORY", "Official directory of registered students and details", cols, rows, stats);
+      
+      const title = isClassFiltered ? `STUDENTS ROSTER - CLASS ${reportSelectedClass.toUpperCase()}` : "STUDENTS ROSTER DIRECTORY";
+      const subtitle = isClassFiltered ? `Official student roster directory for Class: ${reportSelectedClass}` : "Official directory of registered students and details";
+      
+      printReportHTML(title, subtitle, cols, rows, stats);
     } else if (activeReportTab === "attendance") {
       let data = reportAttendanceData;
       if (!data) {
@@ -835,27 +907,41 @@ export default function App() {
           setIsReportLoading(false);
         }
       }
+
       const cols = ["Date Record", "Marked Items", "Present Count", "Late Count", "Absent Count", "Presence Rate"];
       const rows = Object.keys(data).sort().reverse().map(date => {
-        const list = data[date] || [];
+        let list = data[date] || [];
+        if (isClassFiltered) {
+          list = list.filter((a: any) => filteredClassStudents.some(s => s.id === a.studentId));
+        }
+        
+        if (list.length === 0 && isClassFiltered) return null; // skip days with no attendance for this class
+
         const present = list.filter((a: any) => a.status === "Present").length;
         const late = list.filter((a: any) => a.status === "Late").length;
         const absent = list.filter((a: any) => a.status === "Absent").length;
         const rate = list.length > 0 ? Math.round(((present + late) / list.length) * 100) + "%" : "100%";
         return [date, list.length.toString(), present.toString(), late.toString(), absent.toString(), rate];
-      });
-      const totalMarked = Object.keys(data).length;
+      }).filter(Boolean) as string[][];
+
+      const totalMarked = rows.length;
       const stats = [
         { label: "Total Marked Dates", value: totalMarked.toString() },
-        { label: "Attendance Status", value: "Fully Synced" }
+        { label: "Attendance Status", value: isClassFiltered ? `Class ${reportSelectedClass}` : "All Classes" }
       ];
-      printReportHTML("STUDENT ATTENDANCE JOURNAL", "Historical register of student daily presence logs", cols, rows, stats);
+
+      const title = isClassFiltered ? `ATTENDANCE JOURNAL - CLASS ${reportSelectedClass.toUpperCase()}` : "STUDENT ATTENDANCE JOURNAL";
+      const subtitle = isClassFiltered ? `Historical daily presence register for Class: ${reportSelectedClass}` : "Historical register of student daily presence logs";
+
+      printReportHTML(title, subtitle, cols, rows, stats);
     } else {
       const cols = ["Month/Year", "Student Name", "Expected Amount", "Amount Paid", "Balance Due", "Status"];
       const allInvoices: any[] = [];
       Object.keys(fees).forEach(studentId => {
-        const list = fees[studentId] || [];
-        list.forEach(inv => allInvoices.push(inv));
+        if (!isClassFiltered || filteredClassStudents.some(s => s.id === studentId)) {
+          const list = fees[studentId] || [];
+          list.forEach(inv => allInvoices.push(inv));
+        }
       });
       const rows = allInvoices.map(inv => {
         const remaining = inv.amount - inv.paidAmount;
@@ -878,8 +964,308 @@ export default function App() {
         { label: "Collected Amount", value: `${settings.currency} ${totalCollected.toLocaleString()}` },
         { label: "Outstanding Fees", value: `${settings.currency} ${totalBalance.toLocaleString()}` }
       ];
-      printReportHTML("FINANCIAL LEDGER & BILLING", "Official register of tuition invoices and fees ledger", cols, rows, stats);
+
+      const title = isClassFiltered ? `FINANCIAL LEDGER - CLASS ${reportSelectedClass.toUpperCase()}` : "FINANCIAL LEDGER & BILLING";
+      const subtitle = isClassFiltered ? `Invoices and financial ledger for Class: ${reportSelectedClass}` : "Official register of tuition invoices and fees ledger";
+
+      printReportHTML(title, subtitle, cols, rows, stats);
     }
+  };
+
+  const printStudentReportCardHTML = (
+    student: Student,
+    attendanceList: { date: string; status: string }[],
+    feeList: Fee[],
+    attendanceRate: number,
+    stats: { label: string; value: string }[]
+  ) => {
+    const printIframe = document.createElement("iframe");
+    printIframe.style.position = "fixed";
+    printIframe.style.right = "0";
+    printIframe.style.bottom = "0";
+    printIframe.style.width = "0";
+    printIframe.style.height = "0";
+    printIframe.style.border = "none";
+    document.body.appendChild(printIframe);
+
+    const doc = printIframe.contentWindow?.document || printIframe.contentDocument;
+    if (!doc) return;
+
+    const currentSettings = settings;
+    const currentDate = new Date().toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+
+    const attendanceRowsHtml = attendanceList.length === 0
+      ? `<tr><td colspan="2" style="padding: 10px; text-align: center; color: #64748b; font-size: 11px;">Ma jiro xog maqnaansho ah. / No record.</td></tr>`
+      : attendanceList.slice(0, 15).map(a => {
+          let badgeColor = "#10b981"; // Present
+          if (a.status === "Late") badgeColor = "#f59e0b";
+          else if (a.status === "Absent") badgeColor = "#ef4444";
+          return `
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #f1f5f9; font-size: 11px; color: #1e293b;">${a.date}</td>
+              <td style="padding: 8px; border-bottom: 1px solid #f1f5f9; font-size: 11px; text-align: right;">
+                <span style="background-color: ${badgeColor}20; color: ${badgeColor}; padding: 2px 8px; border-radius: 9999px; font-weight: bold; font-size: 10px;">${a.status}</span>
+              </td>
+            </tr>
+          `;
+        }).join("");
+
+    const feeRowsHtml = feeList.length === 0
+      ? `<tr><td colspan="4" style="padding: 10px; text-align: center; color: #64748b; font-size: 11px;">Ma jiro xog lacag bixin ah. / No billing history.</td></tr>`
+      : feeList.map(inv => {
+          const balance = inv.amount - inv.paidAmount;
+          return `
+            <tr>
+              <td style="padding: 8px; border-bottom: 1px solid #f1f5f9; font-size: 11px; color: #1e293b; font-weight: 600;">${inv.month} ${inv.year}</td>
+              <td style="padding: 8px; border-bottom: 1px solid #f1f5f9; font-size: 11px; color: #475569;">${currentSettings.currency} ${inv.amount}</td>
+              <td style="padding: 8px; border-bottom: 1px solid #f1f5f9; font-size: 11px; color: #10b981; font-weight: 600;">${currentSettings.currency} ${inv.paidAmount}</td>
+              <td style="padding: 8px; border-bottom: 1px solid #f1f5f9; font-size: 11px; color: #ef4444;">${currentSettings.currency} ${balance}</td>
+            </tr>
+          `;
+        }).join("");
+
+    const statsHtml = stats.map(stat => `
+      <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 14px; text-align: center; flex: 1; min-width: 100px; box-sizing: border-box;">
+        <span style="display: block; font-size: 9px; color: #64748b; font-weight: bold; text-transform: uppercase; margin-bottom: 4px;">${stat.label}</span>
+        <span style="font-size: 14px; font-weight: bold; color: #0f172a;">${stat.value}</span>
+      </div>
+    `).join("");
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>STUDENT REPORT CARD - ${student.fullName.toUpperCase()}</title>
+          <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+            body {
+              font-family: 'Inter', sans-serif;
+              margin: 40px;
+              color: #0f172a;
+              background-color: #ffffff;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            .header-table {
+              width: 100%;
+              margin-bottom: 25px;
+              border-collapse: collapse;
+            }
+            .school-logo {
+              font-size: 22px;
+              font-weight: 800;
+              color: #4f46e5;
+            }
+            .doc-title {
+              font-size: 18px;
+              font-weight: 800;
+              margin: 0;
+              color: #1e293b;
+              text-transform: uppercase;
+              text-align: right;
+            }
+            .student-info-grid {
+              display: grid;
+              grid-template-columns: 1fr 1fr;
+              gap: 15px;
+              margin-bottom: 25px;
+            }
+            .info-card {
+              background-color: #f8fafc;
+              border: 1px solid #e2e8f0;
+              border-radius: 12px;
+              padding: 15px;
+            }
+            .section-title {
+              font-size: 12px;
+              font-weight: 800;
+              text-transform: uppercase;
+              color: #4f46e5;
+              border-bottom: 2px solid #e2e8f0;
+              padding-bottom: 6px;
+              margin-bottom: 12px;
+              letter-spacing: 0.05em;
+            }
+            .info-row {
+              display: flex;
+              justify-content: space-between;
+              font-size: 11px;
+              padding: 4px 0;
+              border-bottom: 1px dashed #f1f5f9;
+            }
+            .info-label {
+              color: #64748b;
+            }
+            .info-value {
+              font-weight: 600;
+              color: #0f172a;
+            }
+            .tables-container {
+              display: grid;
+              grid-template-columns: 1fr 1.2fr;
+              gap: 20px;
+              margin-bottom: 30px;
+            }
+            .report-table {
+              width: 100%;
+              border-collapse: collapse;
+            }
+            .report-table th {
+              background-color: #f8fafc;
+              color: #475569;
+              font-size: 10px;
+              font-weight: bold;
+              text-transform: uppercase;
+              text-align: left;
+              padding: 8px;
+              border-bottom: 2px solid #e2e8f0;
+            }
+            .signature-line {
+              border-top: 1px solid #cbd5e1;
+              width: 180px;
+              margin-top: 40px;
+              font-size: 10px;
+              color: #64748b;
+              text-align: center;
+              padding-top: 6px;
+            }
+            .footer {
+              margin-top: 40px;
+              font-size: 9px;
+              color: #94a3b8;
+              text-align: center;
+              border-top: 1px solid #f1f5f9;
+              padding-top: 12px;
+            }
+            @page {
+              size: A4;
+              margin: 15mm;
+            }
+          </style>
+        </head>
+        <body>
+          <!-- Header -->
+          <table class="header-table">
+            <tr>
+              <td>
+                <div class="school-logo">🏫 ${currentSettings.schoolName}</div>
+                <div style="font-size: 10px; color: #64748b; margin-top: 2px;">Warbixinta Ardayga ee Rasmiga Ah / Official Student Report</div>
+              </td>
+              <td>
+                <h1 class="doc-title">STUDENT REPORT CARD</h1>
+                <p style="font-size: 10px; color: #64748b; margin: 2px 0 0 0; text-align: right;">Taariikhda: ${currentDate}</p>
+              </td>
+            </tr>
+          </table>
+
+          <!-- Student Profile & Metrics -->
+          <div class="student-info-grid">
+            <div class="info-card">
+              <div class="section-title">Aqoonsiga Ardayga / Student Profile</div>
+              <div class="info-row"><span class="info-label">Magaca / Full Name:</span><span class="info-value" style="font-size: 12px; color: #4f46e5;">${student.fullName}</span></div>
+              <div class="info-row"><span class="info-label">ID-ga Ardayga / Student ID:</span><span class="info-value" style="font-family: monospace;">${student.id.substring(0, 8).toUpperCase()}</span></div>
+              <div class="info-row"><span class="info-label">Fasalka / Class Grade:</span><span class="info-value">${student.class || "Not Assigned"}</span></div>
+              <div class="info-row"><span class="info-label">Cawshada / Gender:</span><span class="info-value capitalize">${student.gender || "Male"}</span></div>
+              <div class="info-row"><span class="info-label">Telefoonka Waalidka / Guardian:</span><span class="info-value">${student.guardianPhone || "-"}</span></div>
+            </div>
+            
+            <div style="display: flex; flex-direction: column; justify-content: space-between;">
+              <div style="display: flex; gap: 8px;">
+                ${statsHtml}
+              </div>
+              <div class="info-card" style="margin-top: 10px; padding: 10px 15px;">
+                <div style="font-size: 10px; color: #64748b; font-weight: bold; text-transform: uppercase;">Xaaladda Diiwaangelinta:</div>
+                <div style="display: flex; align-items: center; gap: 6px; margin-top: 4px;">
+                  <span style="width: 8px; height: 8px; border-radius: 50%; background-color: ${student.status === 'active' ? '#10b981' : '#ef4444'};"></span>
+                  <span style="font-weight: bold; font-size: 12px; text-transform: uppercase; color: ${student.status === 'active' ? '#10b981' : '#ef4444'};">${student.status}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tables Grid -->
+          <div class="tables-container">
+            <!-- Attendance History -->
+            <div>
+              <div class="section-title">Maqnaanshaha / Attendance Log</div>
+              <table class="report-table">
+                <thead>
+                  <tr>
+                    <th style="padding: 6px;">Taariikhda</th>
+                    <th style="padding: 6px; text-align: right;">Xaaladda</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${attendanceRowsHtml}
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Financial History -->
+            <div>
+              <div class="section-title">Lacagaha & Maaliyadda / Fees Ledger</div>
+              <table class="report-table">
+                <thead>
+                  <tr>
+                    <th style="padding: 6px;">Bil/Sanad</th>
+                    <th style="padding: 6px;">Billed</th>
+                    <th style="padding: 6px;">Paid</th>
+                    <th style="padding: 6px;">Due</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${feeRowsHtml}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <hr style="border: 0; border-top: 1px solid #e2e8f0; margin-bottom: 20px;" />
+
+          <!-- Signatures -->
+          <table style="width: 100%; margin-top: 30px;">
+            <tr>
+              <td>
+                <div class="signature-line">
+                  Diyariyay: Maamulaha Dugsiga<br/>
+                  Prepared By: School Administrator
+                </div>
+              </td>
+              <td style="text-align: right;">
+                <div class="signature-line" style="margin-left: auto;">
+                  Saxeex & Shaambad<br/>
+                  Authorized Signature & Stamp
+                </div>
+              </td>
+            </tr>
+          </table>
+
+          <!-- Footer -->
+          <div class="footer">
+            Warbixintan waxaa si toos ah looga soo saaray ${currentSettings.schoolName} School Pro Software.<br/>
+            This document is generated automatically by School Pro. Page 1 of 1.
+          </div>
+        </body>
+      </html>
+    `;
+
+    doc.open();
+    doc.write(htmlContent);
+    doc.close();
+
+    setTimeout(() => {
+      printIframe.contentWindow?.focus();
+      printIframe.contentWindow?.print();
+      setTimeout(() => {
+        document.body.removeChild(printIframe);
+      }, 1000);
+    }, 500);
+
+    showToast(`Warbixinta ardayga ${student.fullName} waa la diyaariyay!`, "success");
   };
 
   const printReportHTML = (
@@ -1129,6 +1515,12 @@ export default function App() {
     const fromStudents = students.map((s) => s.class).filter(Boolean);
     return Array.from(new Set([...fromStudents, ...custom]));
   }, [students, settings.schoolName]);
+
+  const filteredClassStudents = useMemo(() => {
+    return reportSelectedClass === "All"
+      ? students
+      : students.filter((s) => s.class === reportSelectedClass);
+  }, [students, reportSelectedClass]);
 
   const filteredStudents = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
@@ -2287,14 +2679,58 @@ export default function App() {
                       Ku daabaco ama u soo degso dukumentigan qaab PDF rasiimi ah adoo isticmaalaya badhamada hoose.
                     </p>
 
-                    <button
-                      disabled={isReportLoading}
-                      onClick={triggerPdfGeneration}
-                      className="btn btn-primary w-full py-3 flex items-center justify-center gap-2 cursor-pointer text-base bg-[#4f46e5] text-white hover:bg-[#4338ca] transition-all font-semibold rounded-xl"
-                    >
-                      <Printer className="w-5 h-5" />
-                      Daabaco PDF / Print PDF
-                    </button>
+                    {/* Report Filter Selection */}
+                    <div className="border-t border-gray-100 dark:border-gray-800/60 pt-4 space-y-3">
+                      <span className="text-[10px] uppercase font-black tracking-wider text-indigo-500 block">Shaandhaynta / Report Filters</span>
+                      
+                      <div className="space-y-1">
+                        <label className="text-[11px] font-bold text-gray-400 uppercase tracking-tight">Fasalka / Class Group</label>
+                        <select
+                          value={reportSelectedClass}
+                          onChange={(e) => {
+                            setReportSelectedClass(e.target.value);
+                            setReportSelectedStudentId("All");
+                          }}
+                          className="form-input w-full text-xs font-semibold cursor-pointer text-gray-700 dark:text-white bg-slate-50 dark:bg-slate-900 border-slate-200 dark:border-slate-800 rounded-xl"
+                        >
+                          <option value="All">Dhammaan Fasallada (All Classes)</option>
+                          {classesList.map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-[11px] font-bold text-gray-400 uppercase tracking-tight">Ardayga Gaarka ah / Student Card</label>
+                        <select
+                          value={reportSelectedStudentId}
+                          onChange={(e) => setReportSelectedStudentId(e.target.value)}
+                          className="form-input w-full text-xs font-semibold cursor-pointer text-gray-700 dark:text-white bg-slate-50 dark:bg-slate-900 border-slate-200 dark:border-slate-800 rounded-xl"
+                        >
+                          <option value="All">Dhammaan Ardayda (All Students)</option>
+                          {students
+                            .filter(s => reportSelectedClass === "All" || s.class === reportSelectedClass)
+                            .map((s) => (
+                              <option key={s.id} value={s.id}>
+                                {s.fullName} ({s.class || "No Class"})
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="border-t border-gray-100 dark:border-gray-800/60 pt-4">
+                      <button
+                        disabled={isReportLoading}
+                        onClick={triggerPdfGeneration}
+                        className="btn btn-primary w-full py-3 flex items-center justify-center gap-2 cursor-pointer text-base bg-[#4f46e5] text-white hover:bg-[#4338ca] transition-all font-semibold rounded-xl"
+                      >
+                        <Printer className="w-5 h-5" />
+                        Daabaco PDF / Print PDF
+                      </button>
+                    </div>
 
                     <div className="border-t border-gray-100 dark:border-gray-800/60 pt-4 flex flex-col gap-2">
                       <span className="text-[10px] uppercase font-bold tracking-wider text-gray-400">Downloads</span>
@@ -2317,7 +2753,9 @@ export default function App() {
                     </div>
                     <div className="card bg-white dark:bg-[#1e293b] p-4 rounded-xl border border-gray-100 dark:border-gray-800">
                       <span className="text-[10px] uppercase text-gray-400 font-bold block mb-1">Qaybta / Section</span>
-                      <span className="text-sm font-bold text-indigo-600 dark:text-indigo-400 capitalize block">{activeReportTab}</span>
+                      <span className="text-sm font-bold text-indigo-600 dark:text-indigo-400 capitalize block">
+                        {reportSelectedStudentId !== "All" ? "Report Card" : activeReportTab}
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -2331,211 +2769,388 @@ export default function App() {
                       Report Preview
                     </div>
 
-                    {/* Official Letterhead Header */}
-                    <div className="flex justify-between items-start border-b border-gray-100 dark:border-gray-800 pb-5">
-                      <div>
-                        <div className="text-xl font-extrabold text-indigo-600 dark:text-indigo-400 flex items-center gap-1 font-heading">
-                          🏫 {settings.schoolName}
-                        </div>
-                        <p className="text-[10px] text-gray-400 dark:text-gray-500 font-medium mt-1 uppercase tracking-wider">
-                          Nidaamka Rasmiga Ah ee Maamulka Dugsiga
-                        </p>
-                      </div>
-                      <div className="text-right">
-                        <h4 className="text-sm font-black text-slate-800 dark:text-white uppercase tracking-tight">
-                          {activeReportTab === "students" && "Students Directory"}
-                          {activeReportTab === "attendance" && "Attendance Register"}
-                          {activeReportTab === "financials" && "Fees & Invoices Statement"}
-                        </h4>
-                        <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">
-                          Taariikhda: {new Date().toLocaleDateString("en-US", { year: 'numeric', month: 'long', day: 'numeric' })}
-                        </p>
-                      </div>
-                    </div>
+                    {reportSelectedStudentId !== "All" ? (
+                      // INDIVIDUAL STUDENT REPORT CARD PREVIEW
+                      (() => {
+                        const student = students.find(s => s.id === reportSelectedStudentId);
+                        if (!student) return <div className="p-8 text-center text-gray-400">Ardayga lama helin.</div>;
 
-                    {/* Report Information Details Banner */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50 dark:bg-slate-950/35 p-4 rounded-xl border border-slate-100 dark:border-slate-800/80 text-xs text-slate-600 dark:text-slate-400">
-                      <div>
-                        <strong className="text-slate-800 dark:text-white block mb-2 font-bold font-heading">Xogta Dukumentiga / Meta:</strong>
-                        <p>Dugsi: <span className="font-semibold text-slate-800 dark:text-white">{settings.schoolName}</span></p>
-                        <p className="mt-1">Xaalada Nidaamka: <span className="font-semibold text-emerald-600 dark:text-emerald-400">Rasmiga (Active)</span></p>
-                      </div>
-                      <div>
-                        <strong className="text-slate-800 dark:text-white block mb-2 font-bold font-heading">Koobidda Xogta / Metrics Summary:</strong>
-                        {activeReportTab === "students" && (
-                          <>
-                            <p>Ardayda Diiwaangashan: <span className="font-semibold text-slate-800 dark:text-white">{students.length} Arday</span></p>
-                            <p className="mt-1">Ardayda firfircoon (Active): <span className="font-semibold text-slate-800 dark:text-white">{students.filter(s => s.status === 'active').length}</span></p>
-                          </>
-                        )}
-                        {activeReportTab === "attendance" && (
-                          <>
-                            <p>Maalmaha la calaamadeeyay: <span className="font-semibold text-slate-800 dark:text-white">{reportAttendanceData ? Object.keys(reportAttendanceData).length : 0} Maalmood</span></p>
-                            <p className="mt-1">Xiriirinta database: <span className="font-semibold text-emerald-600 dark:text-emerald-400">Healthy & Synchronized</span></p>
-                          </>
-                        )}
-                        {activeReportTab === "financials" && (
-                          <>
-                            <p>Wajibaadka Guud (Expected): <span className="font-semibold text-slate-800 dark:text-white">{settings.currency} {
-                              Object.keys(fees).reduce((sum, id) => sum + (fees[id] || []).reduce((s, inv) => s + Number(inv.amount), 0), 0).toLocaleString()
-                            }</span></p>
-                            <p className="mt-1">Guud ahaan lacagta la bixiyay (Collected): <span className="font-semibold text-emerald-600 dark:text-emerald-400">{settings.currency} {
-                              Object.keys(fees).reduce((sum, id) => sum + (fees[id] || []).reduce((s, inv) => s + Number(inv.paidAmount), 0), 0).toLocaleString()
-                            }</span></p>
-                          </>
-                        )}
-                      </div>
-                    </div>
+                        // Calculate attendance details
+                        const studentAttendance: { date: string; status: string }[] = [];
+                        if (reportAttendanceData) {
+                          Object.keys(reportAttendanceData).sort().reverse().forEach(date => {
+                            const list = reportAttendanceData[date] || [];
+                            const matched = list.find((a: any) => a.studentId === student.id);
+                            if (matched) {
+                              studentAttendance.push({ date, status: matched.status });
+                            }
+                          });
+                        }
+                        const totalSessions = studentAttendance.length;
+                        const presentCount = studentAttendance.filter(a => a.status === "Present").length;
+                        const lateCount = studentAttendance.filter(a => a.status === "Late").length;
+                        const absentCount = studentAttendance.filter(a => a.status === "Absent").length;
+                        const attendanceRate = totalSessions > 0 ? Math.round(((presentCount + lateCount) / totalSessions) * 100) : 100;
 
-                    {/* Table of data */}
-                    <div className="border border-slate-100 dark:border-slate-800 rounded-xl overflow-hidden text-xs">
-                      {isReportLoading ? (
-                        <div className="p-12 text-center text-slate-400 flex flex-col items-center gap-2 justify-center">
-                          <span className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></span>
-                          <span>Soo roraya xogta maqnaanshaha...</span>
+                        // Calculate financial details
+                        const studentFees = fees[student.id] || [];
+                        const totalExpected = studentFees.reduce((sum, f) => sum + Number(f.amount), 0);
+                        const totalPaid = studentFees.reduce((sum, f) => sum + Number(f.paidAmount), 0);
+                        const outstanding = totalExpected - totalPaid;
+
+                        return (
+                          <div className="space-y-6">
+                            {/* Header */}
+                            <div className="flex justify-between items-start border-b border-gray-100 dark:border-gray-800 pb-5">
+                              <div>
+                                <div className="text-xl font-extrabold text-indigo-600 dark:text-indigo-400 flex items-center gap-1 font-heading">
+                                  🏫 {settings.schoolName}
+                                </div>
+                                <p className="text-[10px] text-gray-400 dark:text-gray-500 font-medium mt-1 uppercase tracking-wider">
+                                  Warbixinta Rasmiga ah ee Ardayga / Student Report Card
+                                </p>
+                              </div>
+                              <div className="text-right">
+                                <h4 className="text-sm font-black text-slate-800 dark:text-white uppercase tracking-tight">
+                                  Student Report Card
+                                </h4>
+                                <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">
+                                  Taariikhda: {new Date().toLocaleDateString("en-US", { year: 'numeric', month: 'long', day: 'numeric' })}
+                                </p>
+                              </div>
+                            </div>
+
+                            {/* Student Profile Block */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <div className="bg-slate-50 dark:bg-slate-950/35 p-4 rounded-xl border border-slate-100 dark:border-slate-800/80 text-xs text-slate-600 dark:text-slate-400 space-y-2">
+                                <h5 className="font-bold text-slate-800 dark:text-white border-b border-slate-100 dark:border-slate-800 pb-1 font-heading">Aqoonsiga / Profile</h5>
+                                <p>Magaca: <span className="font-semibold text-slate-800 dark:text-white">{student.fullName}</span></p>
+                                <p>Fasalka: <span className="font-semibold text-slate-800 dark:text-white">{student.class || "Not Assigned"}</span></p>
+                                <p>Cawshada / Gender: <span className="font-semibold text-slate-800 dark:text-white capitalize">{student.gender || "Male"}</span></p>
+                                <p>Telefoonka: <span className="font-semibold text-slate-800 dark:text-white">{student.guardianPhone || "-"}</span></p>
+                              </div>
+
+                              <div className="bg-indigo-50/30 dark:bg-indigo-950/10 p-4 rounded-xl border border-indigo-100/40 dark:border-indigo-900/20 text-xs text-indigo-900 dark:text-indigo-300 grid grid-cols-2 gap-2">
+                                <div className="text-center bg-white dark:bg-slate-900 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800 flex flex-col justify-center">
+                                  <span className="text-[9px] uppercase tracking-wider text-gray-400 font-bold block mb-1">Attendance</span>
+                                  <span className="text-base font-black text-indigo-600 dark:text-indigo-400">{attendanceRate}%</span>
+                                </div>
+                                <div className="text-center bg-white dark:bg-slate-900 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800 flex flex-col justify-center">
+                                  <span className="text-[9px] uppercase tracking-wider text-gray-400 font-bold block mb-1">Balance Due</span>
+                                  <span className="text-base font-black text-red-500">{settings.currency} {outstanding.toLocaleString()}</span>
+                                </div>
+                                <div className="text-center bg-white dark:bg-slate-900 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800 flex flex-col justify-center">
+                                  <span className="text-[9px] uppercase tracking-wider text-gray-400 font-bold block mb-1">Billed</span>
+                                  <span className="text-xs font-bold text-gray-700 dark:text-gray-300">{settings.currency} {totalExpected.toLocaleString()}</span>
+                                </div>
+                                <div className="text-center bg-white dark:bg-slate-900 p-2.5 rounded-lg border border-slate-100 dark:border-slate-800 flex flex-col justify-center">
+                                  <span className="text-[9px] uppercase tracking-wider text-gray-400 font-bold block mb-1">Paid</span>
+                                  <span className="text-xs font-bold text-emerald-600">{settings.currency} {totalPaid.toLocaleString()}</span>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Tables Grid */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-xs">
+                              {/* Left column: Attendance logs */}
+                              <div className="space-y-2">
+                                <h5 className="font-bold text-slate-800 dark:text-white border-b border-slate-100 dark:border-slate-800 pb-1 font-heading">Maqnaanshaha / Attendance History</h5>
+                                <div className="border border-slate-100 dark:border-slate-800 rounded-lg overflow-hidden">
+                                  <table className="w-full text-left border-collapse">
+                                    <thead>
+                                      <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-bold text-[10px]">
+                                        <th className="p-2">Date</th>
+                                        <th className="p-2 text-right">Status</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {studentAttendance.length === 0 ? (
+                                        <tr><td colSpan={2} className="p-4 text-center text-gray-400">No logs found.</td></tr>
+                                      ) : (
+                                        studentAttendance.slice(0, 8).map((a, idx) => (
+                                          <tr key={idx} className="border-b border-slate-50 dark:border-slate-800/30">
+                                            <td className="p-2 font-semibold text-slate-500">{a.date}</td>
+                                            <td className="p-2 text-right">
+                                              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold ${
+                                                a.status === 'Present' ? 'bg-emerald-50 text-emerald-600' :
+                                                a.status === 'Late' ? 'bg-amber-50 text-amber-600' : 'bg-red-50 text-red-600'
+                                              }`}>{a.status}</span>
+                                            </td>
+                                          </tr>
+                                        ))
+                                      )}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+
+                              {/* Right column: Fee Ledger */}
+                              <div className="space-y-2">
+                                <h5 className="font-bold text-slate-800 dark:text-white border-b border-slate-100 dark:border-slate-800 pb-1 font-heading">Lacagaha / Fees & Bills</h5>
+                                <div className="border border-slate-100 dark:border-slate-800 rounded-lg overflow-hidden">
+                                  <table className="w-full text-left border-collapse">
+                                    <thead>
+                                      <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-bold text-[10px]">
+                                        <th className="p-2">Month</th>
+                                        <th className="p-2">Due</th>
+                                        <th className="p-2">Paid</th>
+                                        <th className="p-2">Balance</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {studentFees.length === 0 ? (
+                                        <tr><td colSpan={4} className="p-4 text-center text-gray-400">No billing history.</td></tr>
+                                      ) : (
+                                        studentFees.map((inv, idx) => (
+                                          <tr key={idx} className="border-b border-slate-50 dark:border-slate-800/30">
+                                            <td className="p-2 font-semibold text-slate-400">{inv.month} {inv.year}</td>
+                                            <td className="p-2">{settings.currency} {inv.amount}</td>
+                                            <td className="p-2 text-emerald-600">{settings.currency} {inv.paidAmount}</td>
+                                            <td className="p-2 text-red-500">{settings.currency} {inv.amount - inv.paidAmount}</td>
+                                          </tr>
+                                        ))
+                                      )}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : (
+                      // STANDARD GENERAL OR CLASS FILTERED REPORTS
+                      <>
+                        <div className="flex justify-between items-start border-b border-gray-100 dark:border-gray-800 pb-5">
+                          <div>
+                            <div className="text-xl font-extrabold text-indigo-600 dark:text-indigo-400 flex items-center gap-1 font-heading">
+                              🏫 {settings.schoolName}
+                            </div>
+                            <p className="text-[10px] text-gray-400 dark:text-gray-500 font-medium mt-1 uppercase tracking-wider">
+                              Nidaamka Rasmiga Ah ee Maamulka Dugsiga
+                            </p>
+                          </div>
+                          <div className="text-right">
+                            <h4 className="text-sm font-black text-slate-800 dark:text-white uppercase tracking-tight">
+                              {activeReportTab === "students" && "Students Directory"}
+                              {activeReportTab === "attendance" && "Attendance Register"}
+                              {activeReportTab === "financials" && "Fees & Invoices Statement"}
+                            </h4>
+                            <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">
+                              Taariikhda: {new Date().toLocaleDateString("en-US", { year: 'numeric', month: 'long', day: 'numeric' })}
+                            </p>
+                          </div>
                         </div>
-                      ) : activeReportTab === "students" ? (
-                        <table className="w-full text-left border-collapse">
-                          <thead>
-                            <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
-                              <th className="p-3">ID</th>
-                              <th className="p-3 font-heading">Full Name</th>
-                              <th className="p-3">Class</th>
-                              <th className="p-3">Gender</th>
-                              <th className="p-3">Phone</th>
-                              <th className="p-3">Status</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {students.length === 0 ? (
-                              <tr><td colSpan={6} className="p-4 text-center text-gray-400">Eber arday ah ayaa diiwaangashan.</td></tr>
-                            ) : (
-                              students.slice(0, 15).map(s => (
-                                <tr key={s.id} className="border-b border-slate-50 dark:border-slate-800/30">
-                                  <td className="p-3 font-mono text-[10px]">{s.id.substring(0, 6).toUpperCase()}</td>
-                                  <td className="p-3 font-bold">{s.fullName}</td>
-                                  <td className="p-3">{s.class || "-"}</td>
-                                  <td className="p-3 capitalize">{s.gender || "Male"}</td>
-                                  <td className="p-3">{s.guardianPhone || "-"}</td>
-                                  <td className="p-3">
-                                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                      s.status === 'active' ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
-                                    }`}>{s.status}</span>
-                                  </td>
+
+                        {/* Report Information Details Banner */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50 dark:bg-slate-950/35 p-4 rounded-xl border border-slate-100 dark:border-slate-800/80 text-xs text-slate-600 dark:text-slate-400">
+                          <div>
+                            <strong className="text-slate-800 dark:text-white block mb-2 font-bold font-heading">Xogta Dukumentiga / Meta:</strong>
+                            <p>Dugsi: <span className="font-semibold text-slate-800 dark:text-white">{settings.schoolName}</span></p>
+                            <p className="mt-1">Fasalka / Group: <span className="font-semibold text-indigo-600 dark:text-indigo-400">{reportSelectedClass === "All" ? "Dhammaan Fasallada (All)" : reportSelectedClass}</span></p>
+                          </div>
+                          <div>
+                            <strong className="text-slate-800 dark:text-white block mb-2 font-bold font-heading">Koobidda Xogta / Metrics Summary:</strong>
+                            {activeReportTab === "students" && (
+                              <>
+                                <p>Ardayda Diiwaangashan: <span className="font-semibold text-slate-800 dark:text-white">{filteredClassStudents.length} Arday</span></p>
+                                <p className="mt-1">Ardayda firfircoon (Active): <span className="font-semibold text-slate-800 dark:text-white">{filteredClassStudents.filter(s => s.status === 'active').length}</span></p>
+                              </>
+                            )}
+                            {activeReportTab === "attendance" && (
+                              <>
+                                <p>Maalmaha la calaamadeeyay: <span className="font-semibold text-slate-800 dark:text-white">{reportAttendanceData ? Object.keys(reportAttendanceData).length : 0} Maalmood</span></p>
+                                <p className="mt-1">Fasalka Shaandheysan: <span className="font-semibold text-emerald-600 dark:text-emerald-400">{reportSelectedClass}</span></p>
+                              </>
+                            )}
+                            {activeReportTab === "financials" && (
+                              <>
+                                <p>Wajibaadka Guud (Expected): <span className="font-semibold text-slate-800 dark:text-white">{settings.currency} {
+                                  Object.keys(fees).reduce((sum, id) => {
+                                    if (reportSelectedClass !== "All" && students.find(s => s.id === id)?.class !== reportSelectedClass) return sum;
+                                    return sum + (fees[id] || []).reduce((s, inv) => s + Number(inv.amount), 0);
+                                  }, 0).toLocaleString()
+                                }</span></p>
+                                <p className="mt-1">Guud ahaan lacagta la bixiyay (Collected): <span className="font-semibold text-emerald-600 dark:text-emerald-400">{settings.currency} {
+                                  Object.keys(fees).reduce((sum, id) => {
+                                    if (reportSelectedClass !== "All" && students.find(s => s.id === id)?.class !== reportSelectedClass) return sum;
+                                    return sum + (fees[id] || []).reduce((s, inv) => s + Number(inv.paidAmount), 0);
+                                  }, 0).toLocaleString()
+                                }</span></p>
+                              </>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Table of data */}
+                        <div className="border border-slate-100 dark:border-slate-800 rounded-xl overflow-hidden text-xs">
+                          {isReportLoading ? (
+                            <div className="p-12 text-center text-slate-400 flex flex-col items-center gap-2 justify-center">
+                              <span className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></span>
+                              <span>Soo roraya xogta...</span>
+                            </div>
+                          ) : activeReportTab === "students" ? (
+                            <table className="w-full text-left border-collapse">
+                              <thead>
+                                <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
+                                  <th className="p-3">ID</th>
+                                  <th className="p-3 font-heading">Full Name</th>
+                                  <th className="p-3">Class</th>
+                                  <th className="p-3">Gender</th>
+                                  <th className="p-3">Phone</th>
+                                  <th className="p-3">Status</th>
                                 </tr>
-                              ))
-                            )}
-                            {students.length > 15 && (
-                              <tr className="bg-slate-50/50 dark:bg-slate-800/10">
-                                <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
-                                  + {students.length - 15} Arday oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
-                                </td>
-                              </tr>
-                            )}
-                          </tbody>
-                        </table>
-                      ) : activeReportTab === "attendance" ? (
-                        <table className="w-full text-left border-collapse">
-                          <thead>
-                            <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
-                              <th className="p-3 font-heading">Date</th>
-                              <th className="p-3">Enrolled Count</th>
-                              <th className="p-3">Present</th>
-                              <th className="p-3">Late</th>
-                              <th className="p-3">Absent</th>
-                              <th className="p-3">Rate %</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {!reportAttendanceData || Object.keys(reportAttendanceData).length === 0 ? (
-                              <tr><td colSpan={6} className="p-4 text-center text-gray-400 font-heading">Wax maqnaansho ah oo la calaamadeeyay wali lama helin.</td></tr>
-                            ) : (
-                              Object.keys(reportAttendanceData).sort().reverse().slice(0, 10).map(date => {
-                                const list = reportAttendanceData[date] || [];
-                                const present = list.filter((a: any) => a.status === "Present").length;
-                                const late = list.filter((a: any) => a.status === "Late").length;
-                                const absent = list.filter((a: any) => a.status === "Absent").length;
-                                const rate = list.length > 0 ? Math.round(((present + late) / list.length) * 100) : 100;
-                                return (
-                                  <tr key={date} className="border-b border-slate-50 dark:border-slate-800/30">
-                                    <td className="p-3 font-semibold">{date}</td>
-                                    <td className="p-3">{list.length}</td>
-                                    <td className="p-3 text-emerald-600">{present}</td>
-                                    <td className="p-3 text-amber-500">{late}</td>
-                                    <td className="p-3 text-red-500">{absent}</td>
-                                    <td className="p-3 font-bold text-indigo-600 dark:text-indigo-400">{rate}%</td>
-                                  </tr>
-                                );
-                              })
-                            )}
-                            {reportAttendanceData && Object.keys(reportAttendanceData).length > 10 && (
-                              <tr className="bg-slate-50/50 dark:bg-slate-800/10">
-                                <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
-                                  + {Object.keys(reportAttendanceData).length - 10} Maalmood oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
-                                </td>
-                              </tr>
-                            )}
-                          </tbody>
-                        </table>
-                      ) : (
-                        <table className="w-full text-left border-collapse">
-                          <thead>
-                            <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
-                              <th className="p-3 font-heading">Month</th>
-                              <th className="p-3">Student Name</th>
-                              <th className="p-3">Amount Due</th>
-                              <th className="p-3">Paid</th>
-                              <th className="p-3">Balance Due</th>
-                              <th className="p-3">Status</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {(() => {
-                              const allInvoices: any[] = [];
-                              Object.keys(fees).forEach(sid => {
-                                (fees[sid] || []).forEach(inv => allInvoices.push(inv));
-                              });
-
-                              if (allInvoices.length === 0) {
-                                return <tr><td colSpan={6} className="p-4 text-center text-gray-400 font-heading">Wax invoices ah oo la diiwaangaliyay lama helin.</td></tr>;
-                              }
-
-                              return allInvoices.slice(0, 12).map((inv, idx) => {
-                                const remaining = inv.amount - inv.paidAmount;
-                                return (
-                                  <tr key={idx} className="border-b border-slate-50 dark:border-slate-800/30">
-                                    <td className="p-3 font-semibold text-slate-400">{inv.month} {inv.year}</td>
-                                    <td className="p-3 font-bold">{inv.studentName}</td>
-                                    <td className="p-3">{settings.currency} {inv.amount}</td>
-                                    <td className="p-3 text-emerald-600 font-semibold">{settings.currency} {inv.paidAmount}</td>
-                                    <td className="p-3 text-red-500 font-semibold">{settings.currency} {remaining}</td>
-                                    <td className="p-3">
-                                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                        inv.status === 'Paid' ? 'bg-emerald-50 text-emerald-600' :
-                                        inv.status === 'Unpaid' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'
-                                      }`}>{inv.status}</span>
-                                    </td>
-                                  </tr>
-                                );
-                              });
-                            })()}
-                            {(() => {
-                              const totalInvoices = Object.keys(fees).reduce((sum, sid) => sum + (fees[sid] || []).length, 0);
-                              if (totalInvoices > 12) {
-                                return (
+                              </thead>
+                              <tbody>
+                                {filteredClassStudents.length === 0 ? (
+                                  <tr><td colSpan={6} className="p-4 text-center text-gray-400">Eber arday ah ayaa ku jira fasalkan.</td></tr>
+                                ) : (
+                                  filteredClassStudents.slice(0, 15).map(s => (
+                                    <tr key={s.id} className="border-b border-slate-50 dark:border-slate-800/30">
+                                      <td className="p-3 font-mono text-[10px]">{s.id.substring(0, 6).toUpperCase()}</td>
+                                      <td className="p-3 font-bold">{s.fullName}</td>
+                                      <td className="p-3">{s.class || "-"}</td>
+                                      <td className="p-3 capitalize">{s.gender || "Male"}</td>
+                                      <td className="p-3">{s.guardianPhone || "-"}</td>
+                                      <td className="p-3">
+                                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                          s.status === 'active' ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                                        }`}>{s.status}</span>
+                                      </td>
+                                    </tr>
+                                  ))
+                                )}
+                                {filteredClassStudents.length > 15 && (
                                   <tr className="bg-slate-50/50 dark:bg-slate-800/10">
                                     <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
-                                      + {totalInvoices - 12} Invoices oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
+                                      + {filteredClassStudents.length - 15} Arday oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
                                     </td>
                                   </tr>
-                                );
-                              }
-                              return null;
-                            })()}
-                          </tbody>
-                        </table>
-                      )}
-                    </div>
+                                )}
+                              </tbody>
+                            </table>
+                          ) : activeReportTab === "attendance" ? (
+                            <table className="w-full text-left border-collapse">
+                              <thead>
+                                <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
+                                  <th className="p-3 font-heading">Date</th>
+                                  <th className="p-3">Enrolled Count</th>
+                                  <th className="p-3">Present</th>
+                                  <th className="p-3">Late</th>
+                                  <th className="p-3">Absent</th>
+                                  <th className="p-3">Rate %</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {!reportAttendanceData || Object.keys(reportAttendanceData).length === 0 ? (
+                                  <tr><td colSpan={6} className="p-4 text-center text-gray-400 font-heading">Wax maqnaansho ah oo la calaamadeeyay wali lama helin.</td></tr>
+                                ) : (
+                                  (() => {
+                                    const rowsToRender = Object.keys(reportAttendanceData).sort().reverse().map(date => {
+                                      let list = reportAttendanceData[date] || [];
+                                      if (reportSelectedClass !== "All") {
+                                        list = list.filter((a: any) => filteredClassStudents.some(s => s.id === a.studentId));
+                                      }
+                                      if (list.length === 0 && reportSelectedClass !== "All") return null;
+
+                                      const present = list.filter((a: any) => a.status === "Present").length;
+                                      const late = list.filter((a: any) => a.status === "Late").length;
+                                      const absent = list.filter((a: any) => a.status === "Absent").length;
+                                      const rate = list.length > 0 ? Math.round(((present + late) / list.length) * 100) : 100;
+
+                                      return { date, enrolled: list.length, present, late, absent, rate };
+                                    }).filter(Boolean);
+
+                                    if (rowsToRender.length === 0) {
+                                      return <tr><td colSpan={6} className="p-4 text-center text-gray-400">Ma jiro xog calaamadeysan oo fasalkan ah.</td></tr>;
+                                    }
+
+                                    return (
+                                      <>
+                                        {rowsToRender.slice(0, 10).map((r: any) => (
+                                          <tr key={r.date} className="border-b border-slate-50 dark:border-slate-800/30">
+                                            <td className="p-3 font-semibold">{r.date}</td>
+                                            <td className="p-3">{r.enrolled}</td>
+                                            <td className="p-3 text-emerald-600">{r.present}</td>
+                                            <td className="p-3 text-amber-500">{r.late}</td>
+                                            <td className="p-3 text-red-500">{r.absent}</td>
+                                            <td className="p-3 font-bold text-indigo-600 dark:text-indigo-400">{r.rate}%</td>
+                                          </tr>
+                                        ))}
+                                        {rowsToRender.length > 10 && (
+                                          <tr className="bg-slate-50/50 dark:bg-slate-800/10">
+                                            <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
+                                              + {rowsToRender.length - 10} Maalmood oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
+                                            </td>
+                                          </tr>
+                                        )}
+                                      </>
+                                    );
+                                  })()
+                                )}
+                              </tbody>
+                            </table>
+                          ) : (
+                            <table className="w-full text-left border-collapse">
+                              <thead>
+                                <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
+                                  <th className="p-3 font-heading">Month</th>
+                                  <th className="p-3">Student Name</th>
+                                  <th className="p-3">Amount Due</th>
+                                  <th className="p-3">Paid</th>
+                                  <th className="p-3">Balance Due</th>
+                                  <th className="p-3">Status</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {(() => {
+                                  const allInvoices: any[] = [];
+                                  Object.keys(fees).forEach(sid => {
+                                    if (reportSelectedClass === "All" || students.find(s => s.id === sid)?.class === reportSelectedClass) {
+                                      (fees[sid] || []).forEach(inv => allInvoices.push(inv));
+                                    }
+                                  });
+
+                                  if (allInvoices.length === 0) {
+                                    return <tr><td colSpan={6} className="p-4 text-center text-gray-400 font-heading">Wax invoices ah oo la diiwaangaliyay lama helin.</td></tr>;
+                                  }
+
+                                  return (
+                                    <>
+                                      {allInvoices.slice(0, 12).map((inv, idx) => {
+                                        const remaining = inv.amount - inv.paidAmount;
+                                        return (
+                                          <tr key={idx} className="border-b border-slate-50 dark:border-slate-800/30">
+                                            <td className="p-3 font-semibold text-slate-400">{inv.month} {inv.year}</td>
+                                            <td className="p-3 font-bold">{inv.studentName}</td>
+                                            <td className="p-3">{settings.currency} {inv.amount}</td>
+                                            <td className="p-3 text-emerald-600 font-semibold">{settings.currency} {inv.paidAmount}</td>
+                                            <td className="p-3 text-red-500 font-semibold">{settings.currency} {remaining}</td>
+                                            <td className="p-3">
+                                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                                inv.status === 'Paid' ? 'bg-emerald-50 text-emerald-600' :
+                                                inv.status === 'Unpaid' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'
+                                              }`}>{inv.status}</span>
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                      {allInvoices.length > 12 && (
+                                        <tr className="bg-slate-50/50 dark:bg-slate-800/10">
+                                          <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
+                                            + {allInvoices.length - 12} Invoices oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
+                                          </td>
+                                        </tr>
+                                      )}
+                                    </>
+                                  );
+                                })()}
+                              </tbody>
+                            </table>
+                          )}
+                        </div>
+                      </>
+                    )}
 
                     {/* Official Signature Section */}
                     <div className="flex justify-between items-center pt-8 border-t border-dashed border-gray-100 dark:border-gray-800/80 text-[11px] text-slate-400">
