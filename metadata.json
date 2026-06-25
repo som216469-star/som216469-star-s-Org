@@ -1,0 +1,6 @@
+{
+  "name": "Dugsiga Manager Pro",
+  "description": "Nidaamka Maamulka Dugsiyada oo leh Liiska Ardayda, Maaliyadda, Joogitaanka iyo Warbixinnada.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
