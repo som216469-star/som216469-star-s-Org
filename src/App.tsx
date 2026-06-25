@@ -23,7 +23,8 @@ import {
   Sun,
   ShieldAlert,
   Download,
-  GraduationCap
+  GraduationCap,
+  Printer
 } from "lucide-react";
 import ClassesView from "./components/ClassesView";
 
@@ -115,6 +116,20 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<{ id: string; email: string; name?: string } | null>(null);
   const [isAuthLoading, setIsAuthLoading] = useState<boolean>(false);
 
+  // Email verification (OTP) states
+  const [isOtpMode, setIsOtpMode] = useState<boolean>(false);
+  const [otpCode, setOtpCode] = useState<string>("");
+  const [devOtpSuggestion, setDevOtpSuggestion] = useState<string | null>(null);
+  const [otpCountdown, setOtpCountdown] = useState<number>(0);
+
+  // OTP Countdown Timer
+  useEffect(() => {
+    if (otpCountdown > 0) {
+      const timer = setTimeout(() => setOtpCountdown(otpCountdown - 1), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [otpCountdown]);
+
   // Menu and Navigation State
   const [currentView, setCurrentView] = useState<string>("dashboard");
   const [isSidebarActive, setIsSidebarActive] = useState<boolean>(false);
@@ -137,6 +152,7 @@ export default function App() {
   const [attendanceDate, setAttendanceDate] = useState<string>(
     new Date().toISOString().split("T")[0]
   );
+  const [attendanceSession, setAttendanceSession] = useState<string>("Before Breaktime");
 
   // Search and Filter States
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -153,6 +169,17 @@ export default function App() {
 
   const [auditFee, setAuditFee] = useState<Fee | null>(null);
   const [copiedSchema, setCopiedSchema] = useState<boolean>(false);
+
+  // Advanced Settings & Testing States
+  const [testEmailAddress, setTestEmailAddress] = useState<string>("");
+  const [isSendingTestEmail, setIsSendingTestEmail] = useState<boolean>(false);
+  const [testEmailResult, setTestEmailResult] = useState<{ success?: boolean; error?: string; message?: string } | null>(null);
+  const [selectedDatabaseTab, setSelectedDatabaseTab] = useState<"status" | "schema" | "metrics">("status");
+
+  // Reports Specific State
+  const [activeReportTab, setActiveReportTab] = useState<"students" | "attendance" | "financials">("students");
+  const [reportAttendanceData, setReportAttendanceData] = useState<any>(null);
+  const [isReportLoading, setIsReportLoading] = useState<boolean>(false);
 
   // Toast System
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -227,12 +254,12 @@ export default function App() {
     }
   }, [isAuthenticated]);
 
-  // Handle Attendance date change
+  // Handle Attendance date/session change
   useEffect(() => {
     const fetchAttendance = async () => {
       if (!isAuthenticated) return;
       try {
-        const res = await apiFetch(`/api/attendance?date=${attendanceDate}`);
+        const res = await apiFetch(`/api/attendance?date=${attendanceDate}&session=${attendanceSession}`);
         const data = await res.json();
         setAttendance(data);
       } catch (err) {
@@ -240,7 +267,7 @@ export default function App() {
       }
     };
     fetchAttendance();
-  }, [attendanceDate, isAuthenticated]);
+  }, [attendanceDate, attendanceSession, isAuthenticated]);
 
   // Apply visual theme to document body
   useEffect(() => {
@@ -251,24 +278,25 @@ export default function App() {
     }
   }, [theme]);
 
-  // Secure Login / SignUp Handler
+  // Secure Login / SignUp Handler (Requesting OTP)
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!authEmail.trim() || !authPassword) {
-      showToast("Please fill in all required fields!", "warning");
+      showToast("Tixraac dhamaan meelaha banaan! / Please fill in all required fields!", "warning");
       return;
     }
 
     setIsAuthLoading(true);
+    setDevOtpSuggestion(null);
     try {
-      const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/signup";
       const payload = {
         email: authEmail.trim(),
         password: authPassword,
-        name: authMode === "signup" ? authName.trim() : undefined
+        name: authMode === "signup" ? authName.trim() : undefined,
+        mode: authMode
       };
 
-      const res = await apiFetch(endpoint, {
+      const res = await apiFetch("/api/auth/send-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -276,28 +304,115 @@ export default function App() {
 
       const data = await res.json();
       if (!res.ok) {
-        showToast(data.error || "An error occurred!", "error");
+        showToast(data.error || "Cillad ayaa dhacday! / An error occurred!", "error");
         setIsAuthLoading(false);
         return;
       }
 
+      // Success - Transition to OTP input mode!
+      setIsOtpMode(true);
+      setOtpCountdown(60); // 60 seconds resend cooldown
+      setOtpCode(""); // clear any old OTP input
+      
+      if (data.devOtp) {
+        setDevOtpSuggestion(data.devOtp);
+      }
+
+      showToast(data.message || "Code-ka xaqiijinta waa la diray! / Verification code sent!", "success");
+    } catch (err: any) {
+      console.error("Auth send OTP error:", err);
+      showToast("Xiriirka wuu fashilmay. Fadlan isku day markale. / Connection failed. Please try again.", "error");
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  // Secure OTP Verification Handler
+  const handleOtpVerifySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!otpCode.trim() || otpCode.trim().length < 6) {
+      showToast("Fadlan geli code 6-god ah! / Please enter a valid 6-digit code!", "warning");
+      return;
+    }
+
+    setIsAuthLoading(true);
+    try {
+      const payload = {
+        email: authEmail.trim(),
+        otp: otpCode.trim(),
+        mode: authMode
+      };
+
+      const res = await apiFetch("/api/auth/verify-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        showToast(data.error || "Code-ku waa khaldanyahay! / Incorrect verification code!", "error");
+        setIsAuthLoading(false);
+        return;
+      }
+
+      // Successful verification! Log the user in
       sessionStorage.setItem("dugsiga_2026_auth", "true");
       sessionStorage.setItem("dugsiga_2026_user", JSON.stringify(data.user));
       setCurrentUser(data.user);
       setIsAuthenticated(true);
-      
+      setIsOtpMode(false);
+      setDevOtpSuggestion(null);
+
       showToast(
         authMode === "login" 
-          ? `Welcome, ${data.user.name || data.user.email}!` 
-          : "Registration successful!", 
+          ? `Ku soo dhawaada, ${data.user.name || data.user.email}!` 
+          : "Diiwaangelintu si guul leh ayay u dhacday! / Registration successful!", 
         "success"
       );
       
       // Clear password field
       setAuthPassword("");
     } catch (err: any) {
-      console.error("Auth submit error:", err);
-      showToast("Connection failed. Please try again.", "error");
+      console.error("OTP verification error:", err);
+      showToast("Xiriirka xaqiijinta wuu fashilmay. / Verification connection failed.", "error");
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  // Resend OTP Helper
+  const handleResendOtp = async () => {
+    if (otpCountdown > 0) return;
+    setIsAuthLoading(true);
+    setDevOtpSuggestion(null);
+    try {
+      const payload = {
+        email: authEmail.trim(),
+        password: authPassword,
+        name: authMode === "signup" ? authName.trim() : undefined,
+        mode: authMode
+      };
+
+      const res = await apiFetch("/api/auth/send-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setOtpCountdown(60);
+        if (data.devOtp) {
+          setDevOtpSuggestion(data.devOtp);
+        }
+        showToast("Code cusub ayaa lagu soo diray! / A new code has been sent!", "success");
+      } else {
+        showToast(data.error || "Waa fashilantay in code kale loo diro. / Failed to resend code.", "error");
+      }
+    } catch (err) {
+      console.error("Resend OTP error:", err);
+      showToast("Cillad dhanka internetka ah. / Network error occurred.", "error");
     } finally {
       setIsAuthLoading(false);
     }
@@ -480,11 +595,12 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           date: attendanceDate,
+          session: attendanceSession,
           records
         })
       });
       if (res.ok) {
-        showToast(`Attendance sheet for class ${selectedAttendanceClass} on ${attendanceDate} successfully saved!`, "success");
+        showToast(`Attendance sheet for class ${selectedAttendanceClass} (${attendanceSession}) on ${attendanceDate} successfully saved!`, "success");
       } else {
         showToast("Failed to save attendance sheet", "error");
       }
@@ -630,6 +746,38 @@ export default function App() {
     }
   };
 
+  const handleTestEmailSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!testEmailAddress) {
+      showToast("Geli ciwaanka emailka si aad u tijaabiso!", "warning");
+      return;
+    }
+
+    setIsSendingTestEmail(true);
+    setTestEmailResult(null);
+
+    try {
+      const res = await apiFetch("/api/settings/test-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: testEmailAddress })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setTestEmailResult({ success: true, message: data.message });
+        showToast("Email-kii tijaabada ahaa si sax ah ayaa loo soo diray!", "success");
+      } else {
+        setTestEmailResult({ success: false, error: data.error || "Aaladda emailka SMTP wali lama isku xirin amaba waa khaldantahay." });
+        showToast(data.error || "Ku guuldareystay in la diro tijaabada SMTP.", "error");
+      }
+    } catch (err: any) {
+      setTestEmailResult({ success: false, error: "Cillad farsamo oo ku timid server-ka nidaamka." });
+      showToast("Cillad farsamo ayaa dhacday intii emailka la dirayay.", "error");
+    } finally {
+      setIsSendingTestEmail(false);
+    }
+  };
+
   // Copy Supabase SQL Schema Helper
   const copySqlSchema = () => {
     if (dbStatus) {
@@ -652,6 +800,317 @@ export default function App() {
     downloadAnchor.click();
     downloadAnchor.remove();
     showToast(`File '${filename}' has been successfully downloaded!`);
+  };
+
+  const triggerPdfGeneration = async () => {
+    if (activeReportTab === "students") {
+      const cols = ["Student ID", "Full Name", "Class / Grade", "Gender", "Guardian Phone", "Status"];
+      const rows = students.map(s => [
+        s.id.substring(0, 8).toUpperCase(),
+        s.fullName,
+        s.class || "Not Assigned",
+        s.gender || "Male",
+        s.guardianPhone || "-",
+        s.status.toUpperCase()
+      ]);
+      const stats = [
+        { label: "Total Students", value: students.length.toString() },
+        { label: "Active Enrolled", value: students.filter(s => s.status === 'active').length.toString() },
+        { label: "Male Students", value: students.filter(s => s.gender?.toLowerCase() === 'male' || s.gender?.toLowerCase() === 'boy' || s.gender?.toLowerCase() === 'lab').length.toString() }
+      ];
+      printReportHTML("STUDENTS ROSTER DIRECTORY", "Official directory of registered students and details", cols, rows, stats);
+    } else if (activeReportTab === "attendance") {
+      let data = reportAttendanceData;
+      if (!data) {
+        setIsReportLoading(true);
+        try {
+          const res = await apiFetch("/api/attendance/all");
+          data = await res.json();
+          setReportAttendanceData(data);
+        } catch (err) {
+          showToast("Ku guuldareystay soo celinta xogta maqnaanshaha", "error");
+          setIsReportLoading(false);
+          return;
+        } finally {
+          setIsReportLoading(false);
+        }
+      }
+      const cols = ["Date Record", "Marked Items", "Present Count", "Late Count", "Absent Count", "Presence Rate"];
+      const rows = Object.keys(data).sort().reverse().map(date => {
+        const list = data[date] || [];
+        const present = list.filter((a: any) => a.status === "Present").length;
+        const late = list.filter((a: any) => a.status === "Late").length;
+        const absent = list.filter((a: any) => a.status === "Absent").length;
+        const rate = list.length > 0 ? Math.round(((present + late) / list.length) * 100) + "%" : "100%";
+        return [date, list.length.toString(), present.toString(), late.toString(), absent.toString(), rate];
+      });
+      const totalMarked = Object.keys(data).length;
+      const stats = [
+        { label: "Total Marked Dates", value: totalMarked.toString() },
+        { label: "Attendance Status", value: "Fully Synced" }
+      ];
+      printReportHTML("STUDENT ATTENDANCE JOURNAL", "Historical register of student daily presence logs", cols, rows, stats);
+    } else {
+      const cols = ["Month/Year", "Student Name", "Expected Amount", "Amount Paid", "Balance Due", "Status"];
+      const allInvoices: any[] = [];
+      Object.keys(fees).forEach(studentId => {
+        const list = fees[studentId] || [];
+        list.forEach(inv => allInvoices.push(inv));
+      });
+      const rows = allInvoices.map(inv => {
+        const remaining = inv.amount - inv.paidAmount;
+        return [
+          `${inv.month} ${inv.year}`,
+          inv.studentName || "Student",
+          `${settings.currency} ${inv.amount}`,
+          `${settings.currency} ${inv.paidAmount}`,
+          `${settings.currency} ${remaining}`,
+          inv.status.toUpperCase()
+        ];
+      });
+      
+      const totalExpected = allInvoices.reduce((sum, inv) => sum + Number(inv.amount), 0);
+      const totalCollected = allInvoices.reduce((sum, inv) => sum + Number(inv.paidAmount), 0);
+      const totalBalance = totalExpected - totalCollected;
+
+      const stats = [
+        { label: "Expected Revenue", value: `${settings.currency} ${totalExpected.toLocaleString()}` },
+        { label: "Collected Amount", value: `${settings.currency} ${totalCollected.toLocaleString()}` },
+        { label: "Outstanding Fees", value: `${settings.currency} ${totalBalance.toLocaleString()}` }
+      ];
+      printReportHTML("FINANCIAL LEDGER & BILLING", "Official register of tuition invoices and fees ledger", cols, rows, stats);
+    }
+  };
+
+  const printReportHTML = (
+    title: string,
+    subtitle: string,
+    columns: string[],
+    dataRows: string[][],
+    summaryStats?: { label: string; value: string }[]
+  ) => {
+    const printIframe = document.createElement("iframe");
+    printIframe.style.position = "fixed";
+    printIframe.style.right = "0";
+    printIframe.style.bottom = "0";
+    printIframe.style.width = "0";
+    printIframe.style.height = "0";
+    printIframe.style.border = "none";
+    document.body.appendChild(printIframe);
+
+    const doc = printIframe.contentWindow?.document || printIframe.contentDocument;
+    if (!doc) return;
+
+    const currentSettings = settings;
+    const currentDate = new Date().toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+
+    const columnsHtml = columns
+      .map(
+        (col) =>
+          `<th style="text-align: left; padding: 12px 8px; border-bottom: 2px solid #e2e8f0; font-size: 11px; text-transform: uppercase; color: #475569; letter-spacing: 0.05em;">${col}</th>`
+      )
+      .join("");
+
+    const rowsHtml = dataRows
+      .map((row) => {
+        const cols = row
+          .map(
+            (val) =>
+              `<td style="padding: 10px 8px; border-bottom: 1px solid #f1f5f9; font-size: 12px; color: #1e293b;">${val}</td>`
+          )
+          .join("");
+        return `<tr>${cols}</tr>`;
+      })
+      .join("");
+
+    const statsHtml = summaryStats
+      ? summaryStats
+          .map(
+            (stat) => `
+      <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 14px; text-align: center; flex: 1; min-width: 100px;">
+        <span style="display: block; font-size: 10px; color: #64748b; font-weight: bold; text-transform: uppercase; margin-bottom: 4px;">${stat.label}</span>
+        <span style="font-size: 15px; font-weight: bold; color: #0f172a;">${stat.value}</span>
+      </div>
+    `
+          )
+          .join("")
+      : "";
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>${title}</title>
+          <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+            body {
+              font-family: 'Inter', sans-serif;
+              margin: 40px;
+              color: #0f172a;
+              background-color: #ffffff;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            .header-table {
+              width: 100%;
+              margin-bottom: 30px;
+              border-collapse: collapse;
+            }
+            .school-logo {
+              font-size: 24px;
+              font-weight: 800;
+              color: #4f46e5;
+            }
+            .doc-title-container {
+              text-align: right;
+            }
+            .doc-title {
+              font-size: 20px;
+              font-weight: 800;
+              margin: 0;
+              color: #1e293b;
+              text-transform: uppercase;
+              letter-spacing: -0.02em;
+            }
+            .doc-subtitle {
+              font-size: 11px;
+              color: #64748b;
+              margin: 4px 0 0 0;
+            }
+            .info-box {
+              background-color: #f8fafc;
+              border: 1px solid #f1f5f9;
+              border-radius: 12px;
+              padding: 14px;
+              font-size: 11px;
+              line-height: 1.5;
+            }
+            .data-table {
+              width: 100%;
+              border-collapse: collapse;
+              margin-bottom: 40px;
+            }
+            .signature-line {
+              border-top: 1px solid #cbd5e1;
+              width: 200px;
+              margin-top: 50px;
+              font-size: 11px;
+              color: #64748b;
+              text-align: center;
+              padding-top: 6px;
+            }
+            .footer {
+              margin-top: 50px;
+              font-size: 10px;
+              color: #94a3b8;
+              text-align: center;
+              border-top: 1px solid #f1f5f9;
+              padding-top: 15px;
+            }
+            @page {
+              size: A4;
+              margin: 20mm;
+            }
+          </style>
+        </head>
+        <body>
+          <!-- Header -->
+          <table class="header-table">
+            <tr>
+              <td style="vertical-align: middle;">
+                <div class="school-logo">🏫 ${currentSettings.schoolName}</div>
+                <div style="font-size: 11px; color: #64748b; margin-top: 4px;">Nidaamka Maamulka Dugsiga / School Management SaaS</div>
+              </td>
+              <td class="doc-title-container" style="vertical-align: middle;">
+                <h1 class="doc-title">${title}</h1>
+                <p class="doc-subtitle">${subtitle}</p>
+              </td>
+            </tr>
+          </table>
+
+          <!-- Metadata and Stats -->
+          <div style="display: flex; gap: 20px; margin-bottom: 30px; align-items: center;">
+            <div class="info-box" style="flex: 1.5; min-width: 220px;">
+              <strong style="font-size: 12px; color: #0f172a; display: block; margin-bottom: 6px;">Warbixinta Nidaamka / Report Details</strong>
+              <table style="width: 100%; font-size: 11px; border-collapse: collapse;">
+                <tr>
+                  <td style="color: #64748b; padding: 2px 0;">Dugsi / Institution:</td>
+                  <td style="font-weight: 600; text-align: right;">${currentSettings.schoolName}</td>
+                </tr>
+                <tr>
+                  <td style="color: #64748b; padding: 2px 0;">Taariikhda / Date Printed:</td>
+                  <td style="font-weight: 600; text-align: right;">${currentDate}</td>
+                </tr>
+                <tr>
+                  <td style="color: #64748b; padding: 2px 0;">Habka Nidaamka / Ruleset:</td>
+                  <td style="font-weight: 600; text-align: right;">${currentSettings.attendanceRules} Mode</td>
+                </tr>
+              </table>
+            </div>
+            
+            <div style="flex: 2; display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end;">
+              ${statsHtml}
+            </div>
+          </div>
+
+          <hr style="border: 0; border-top: 1px solid #e2e8f0; margin-bottom: 25px;" />
+
+          <!-- Data Table -->
+          <table class="data-table">
+            <thead>
+              <tr>
+                ${columnsHtml}
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+          </table>
+
+          <!-- Signature Lines -->
+          <table style="width: 100%; margin-top: 40px;">
+            <tr>
+              <td>
+                <div class="signature-line">
+                  Diyariyay: Maamulaha Dugsiga<br/>
+                  Prepared By: School Administrator
+                </div>
+              </td>
+              <td style="text-align: right;">
+                <div class="signature-line" style="margin-left: auto;">
+                  Saxeex & Shaambad<br/>
+                  Authorized Signature & Stamp
+                </div>
+              </td>
+            </tr>
+          </table>
+
+          <!-- Footer -->
+          <div class="footer">
+            Warbixintan waxaa si toos ah looga soo saaray ${currentSettings.schoolName} School Pro Software.<br/>
+            This document is generated automatically by School Pro. Page 1 of 1.
+          </div>
+        </body>
+      </html>
+    `;
+
+    doc.open();
+    doc.write(htmlContent);
+    doc.close();
+
+    setTimeout(() => {
+      printIframe.contentWindow?.focus();
+      printIframe.contentWindow?.print();
+      setTimeout(() => {
+        document.body.removeChild(printIframe);
+      }, 1000);
+    }, 500);
+
+    showToast(`PDF Report generated and browser print triggered!`, "success");
   };
 
   const handleFactoryReset = async () => {
@@ -773,81 +1232,164 @@ export default function App() {
             </p>
           </div>
 
-          <form onSubmit={handleAuthSubmit} className="space-y-4">
-            {authMode === "signup" && (
-              <div>
-                <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-1">
-                  Full Name
-                </label>
-                <input
-                  type="text"
-                  value={authName}
-                  onChange={(e) => setAuthName(e.target.value)}
-                  className="form-input"
-                  placeholder="Teacher John"
-                  required
-                />
+          {isOtpMode ? (
+            <div className="space-y-6">
+              <div className="text-center">
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  Waxaan ku soo dirnay code xaqiijin ah oo 6-god ah emailkaaga:
+                </p>
+                <p className="font-bold text-gray-800 dark:text-white mt-1 select-all">
+                  {authEmail}
+                </p>
               </div>
-            )}
-            
-            <div>
-              <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-1">
-                Email Address (or 'admin' for quick demo)
-              </label>
-              <input
-                type="text"
-                value={authEmail}
-                onChange={(e) => setAuthEmail(e.target.value)}
-                className="form-input"
-                placeholder="example@school.com"
-                required
-              />
+
+              <form onSubmit={handleOtpVerifySubmit} className="space-y-4">
+                <div>
+                  <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-2 text-center">
+                    Geli Code-ka Xaqiijinta (Verification Code)
+                  </label>
+                  <input
+                    type="text"
+                    maxLength={6}
+                    value={otpCode}
+                    onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ""))}
+                    className="form-input text-center text-2xl tracking-widest font-mono font-bold py-3 border-indigo-300 dark:border-indigo-800 focus:border-indigo-500 rounded-xl"
+                    placeholder="000000"
+                    required
+                  />
+                </div>
+
+                {devOtpSuggestion && (
+                  <div className="p-3 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/30 rounded-xl text-xs text-amber-800 dark:text-amber-300">
+                    <p className="font-semibold flex items-center gap-1">
+                      🔧 Habka Tijaabada (Dev Mode)
+                    </p>
+                    <p className="mt-1">
+                      SMTP email laguma qaabayn .env. Nidaamku wuxuu kuu soo saaray code-kan si aad u tijaabiso: <strong className="text-sm font-mono tracking-wider select-all">{devOtpSuggestion}</strong>
+                    </p>
+                  </div>
+                )}
+
+                <button 
+                  type="submit" 
+                  disabled={isAuthLoading}
+                  className="btn btn-primary w-full mt-2 py-3 text-lg font-semibold bg-[#4f46e5] text-white hover:bg-[#4338ca] transition-all flex justify-center items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  {isAuthLoading ? (
+                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  ) : (
+                    "Hubi oo Sax / Verify & Complete"
+                  )}
+                </button>
+              </form>
+
+              <div className="flex flex-col items-center gap-3 pt-2">
+                <div className="text-sm">
+                  {otpCountdown > 0 ? (
+                    <span className="text-gray-400">
+                      Diris kale waxay furan tahay {otpCountdown}s gudahood
+                    </span>
+                  ) : (
+                    <button
+                      onClick={handleResendOtp}
+                      disabled={isAuthLoading}
+                      className="text-[#4f46e5] dark:text-[#818cf8] font-semibold hover:underline bg-transparent border-0 cursor-pointer"
+                    >
+                      Diri Code cusub (Resend Code)
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  onClick={() => {
+                    setIsOtpMode(false);
+                    setDevOtpSuggestion(null);
+                  }}
+                  className="text-xs text-gray-400 dark:text-gray-500 hover:underline hover:text-gray-600 dark:hover:text-gray-400 bg-transparent border-0 cursor-pointer"
+                >
+                  ← Dib u noqo oo badal Emailka / Go back
+                </button>
+              </div>
             </div>
+          ) : (
+            <>
+              <form onSubmit={handleAuthSubmit} className="space-y-4">
+                {authMode === "signup" && (
+                  <div>
+                    <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-1">
+                      Full Name
+                    </label>
+                    <input
+                      type="text"
+                      value={authName}
+                      onChange={(e) => setAuthName(e.target.value)}
+                      className="form-input"
+                      placeholder="Teacher John"
+                      required
+                    />
+                  </div>
+                )}
+                
+                <div>
+                  <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-1">
+                    Email Address
+                  </label>
+                  <input
+                    type="text"
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    className="form-input"
+                    placeholder="example@school.com"
+                    required
+                  />
+                </div>
 
-            <div>
-              <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-1">
-                Password
-              </label>
-              <input
-                type="password"
-                value={authPassword}
-                onChange={(e) => setAuthPassword(e.target.value)}
-                className="form-input"
-                placeholder="********"
-                required
-              />
-            </div>
+                <div>
+                  <label className="block text-gray-500 dark:text-gray-400 text-sm font-medium mb-1">
+                    Password
+                  </label>
+                  <input
+                    type="password"
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    className="form-input"
+                    placeholder="********"
+                    required
+                  />
+                </div>
 
-            <button 
-              type="submit" 
-              disabled={isAuthLoading}
-              className="btn btn-primary w-full mt-4 py-3 text-lg font-semibold bg-[#4f46e5] text-white hover:bg-[#4338ca] transition-all flex justify-center items-center gap-2 cursor-pointer disabled:opacity-50"
-            >
-              {isAuthLoading ? (
-                <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-              ) : authMode === "login" ? (
-                "Login"
-              ) : (
-                "Sign Up"
-              )}
-            </button>
-          </form>
+                <button 
+                  type="submit" 
+                  disabled={isAuthLoading}
+                  className="btn btn-primary w-full mt-4 py-3 text-lg font-semibold bg-[#4f46e5] text-white hover:bg-[#4338ca] transition-all flex justify-center items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  {isAuthLoading ? (
+                    <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  ) : authMode === "login" ? (
+                    "Login"
+                  ) : (
+                    "Sign Up"
+                  )}
+                </button>
+              </form>
 
-          <div className="mt-6 text-center">
-            <button
-              onClick={() => {
-                setAuthMode(authMode === "login" ? "signup" : "login");
-                setAuthEmail("");
-                setAuthPassword("");
-                setAuthName("");
-              }}
-              className="text-sm font-medium text-[#4f46e5] dark:text-[#818cf8] hover:underline cursor-pointer bg-transparent border-0"
-            >
-              {authMode === "login" 
-                ? "Don't have an account? Sign Up" 
-                : "Already have an account? Login"}
-            </button>
-          </div>
+              <div className="mt-6 text-center">
+                <button
+                  onClick={() => {
+                    setAuthMode(authMode === "login" ? "signup" : "login");
+                    setAuthEmail("");
+                    setAuthPassword("");
+                    setAuthName("");
+                  }}
+                  className="text-sm font-medium text-[#4f46e5] dark:text-[#818cf8] hover:underline cursor-pointer bg-transparent border-0"
+                >
+                  {authMode === "login" 
+                    ? "Don't have an account? Sign Up" 
+                    : "Already have an account? Login"}
+                </button>
+              </div>
+            </>
+          )}
 
           <div className="mt-6 text-center text-xs text-gray-400 dark:text-gray-600 border-t border-gray-100 dark:border-gray-800/60 pt-4">
             School Pro © 2026 • Production SaaS Platform
@@ -1170,9 +1712,19 @@ export default function App() {
 
                 {/* Chart 2: Attendance Doughnut / Arc Visualizer */}
                 <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm">
-                  <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading mb-4">
-                    Today's Attendance
-                  </h3>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
+                      Today's Attendance
+                    </h3>
+                    <select
+                      value={attendanceSession}
+                      onChange={(e) => setAttendanceSession(e.target.value)}
+                      className="form-input text-xs py-1 px-2 w-auto font-semibold cursor-pointer border-indigo-200 dark:border-indigo-900/30 text-indigo-700 dark:text-indigo-300 bg-indigo-50/50 dark:bg-indigo-950/10 rounded-lg"
+                    >
+                      <option value="Before Breaktime">Before Break</option>
+                      <option value="After Breaktime">After Break</option>
+                    </select>
+                  </div>
                   <div className="flex flex-col items-center justify-center py-4">
                     <div className="relative w-40 h-40 flex items-center justify-center">
                       {/* Simple high-craft circular representation */}
@@ -1247,7 +1799,7 @@ export default function App() {
                 if (sRes.ok) setStudents(await sRes.json());
                 const fRes = await apiFetch("/api/fees");
                 if (fRes.ok) setFees(await fRes.json());
-                const aRes = await apiFetch(`/api/attendance?date=${attendanceDate}`);
+                const aRes = await apiFetch(`/api/attendance?date=${attendanceDate}&session=${attendanceSession}`);
                 if (aRes.ok) setAttendance(await aRes.json());
               }}
               openAddStudentToClass={(className) => {
@@ -1412,6 +1964,14 @@ export default function App() {
                     max={new Date().toISOString().split("T")[0]}
                     className="form-input w-auto font-semibold cursor-pointer text-gray-700 dark:text-white"
                   />
+                  <select
+                    value={attendanceSession}
+                    onChange={(e) => setAttendanceSession(e.target.value)}
+                    className="form-input w-auto font-semibold cursor-pointer border-indigo-200 dark:border-indigo-900/30 text-indigo-700 dark:text-indigo-300 bg-indigo-50/50 dark:bg-indigo-950/10"
+                  >
+                    <option value="Before Breaktime">Before Breaktime (Nasashada Ka Hor)</option>
+                    <option value="After Breaktime">After Breaktime (Nasashada Ka Dib)</option>
+                  </select>
                   <button onClick={handleSaveAttendance} className="btn btn-primary flex items-center gap-2">
                     <Check className="w-5 h-5" />
                     Save Sheet
@@ -1649,105 +2209,382 @@ export default function App() {
           {/* VIEW: REPORTS & EXPORTS */}
           {currentView === "reports" && (
             <div className="fade-in space-y-6">
-              <div className="topbar">
-                <h2 className="text-3xl font-bold text-gray-800 dark:text-white font-heading">
-                  Reports & Analytics
-                </h2>
-                <p className="text-gray-400 dark:text-gray-500 text-sm">
-                  Export system database arrays to analyze or import offline
-                </p>
+              <div className="topbar flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-3xl font-black text-gray-800 dark:text-white font-heading">
+                    Official PDF Reports & Documents
+                  </h2>
+                  <p className="text-gray-400 dark:text-gray-500 text-sm">
+                    Sii-da oo daabaco dukumentiyada rasmiga ah ee dugsiga qaab PDF tayo sare leh
+                  </p>
+                </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm flex flex-col justify-between">
-                  <div>
-                    <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
-                      Student Roster Data
-                    </h3>
-                    <p className="text-gray-400 dark:text-gray-500 text-sm mt-1.5 mb-6">
-                      Download list of all students registered in the school with guardian phone numbers.
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => exportData(students, "students_roster.json")}
-                    className="btn btn-secondary w-full flex items-center justify-center gap-2"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download Students JSON
-                  </button>
-                </div>
+              {/* Navigation Tabs */}
+              <div className="flex border-b border-gray-100 dark:border-gray-800/80 gap-1 overflow-x-auto">
+                <button
+                  onClick={() => setActiveReportTab("students")}
+                  className={`px-5 py-3 text-sm font-semibold border-b-2 transition-all flex items-center gap-2 shrink-0 cursor-pointer ${
+                    activeReportTab === "students"
+                      ? "border-[#4f46e5] text-[#4f46e5] dark:text-[#818cf8]"
+                      : "border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                  }`}
+                >
+                  <Users className="w-4 h-4" />
+                  👤 Student Roster PDF
+                </button>
 
-                <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm flex flex-col justify-between">
-                  <div>
-                    <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
-                      Attendance Logs
-                    </h3>
-                    <p className="text-gray-400 dark:text-gray-500 text-sm mt-1.5 mb-6">
-                      Download attendance records for all marked dates in JSON format.
-                    </p>
-                  </div>
-                  <button
-                    onClick={async () => {
+                <button
+                  onClick={async () => {
+                    setActiveReportTab("attendance");
+                    if (!reportAttendanceData) {
+                      setIsReportLoading(true);
                       try {
                         const res = await apiFetch("/api/attendance/all");
                         const data = await res.json();
-                        exportData(data, "attendance_records.json");
+                        setReportAttendanceData(data);
                       } catch (err) {
-                        showToast("Failed to fetch attendance report", "error");
+                        showToast("Ku guuldareystay soo celinta xogta maqnaanshaha", "error");
+                      } finally {
+                        setIsReportLoading(false);
                       }
-                    }}
-                    className="btn btn-secondary w-full flex items-center justify-center gap-2"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download Attendance JSON
-                  </button>
+                    }
+                  }}
+                  className={`px-5 py-3 text-sm font-semibold border-b-2 transition-all flex items-center gap-2 shrink-0 cursor-pointer ${
+                    activeReportTab === "attendance"
+                      ? "border-[#4f46e5] text-[#4f46e5] dark:text-[#818cf8]"
+                      : "border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                  }`}
+                >
+                  <Calendar className="w-4 h-4" />
+                  📅 Attendance Journal PDF
+                </button>
+
+                <button
+                  onClick={() => setActiveReportTab("financials")}
+                  className={`px-5 py-3 text-sm font-semibold border-b-2 transition-all flex items-center gap-2 shrink-0 cursor-pointer ${
+                    activeReportTab === "financials"
+                      ? "border-[#4f46e5] text-[#4f46e5] dark:text-[#818cf8]"
+                      : "border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                  }`}
+                >
+                  <CreditCard className="w-4 h-4" />
+                  💰 Financial Ledger PDF
+                </button>
+              </div>
+
+              {/* Main Content: Split Sidebar & Interactive Document Preview */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                
+                {/* Control and Stats Sidebar */}
+                <div className="space-y-6">
+                  <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm space-y-4">
+                    <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
+                      Actions & PDF Exports
+                    </h3>
+                    
+                    <p className="text-xs text-gray-400">
+                      Ku daabaco ama u soo degso dukumentigan qaab PDF rasiimi ah adoo isticmaalaya badhamada hoose.
+                    </p>
+
+                    <button
+                      disabled={isReportLoading}
+                      onClick={triggerPdfGeneration}
+                      className="btn btn-primary w-full py-3 flex items-center justify-center gap-2 cursor-pointer text-base bg-[#4f46e5] text-white hover:bg-[#4338ca] transition-all font-semibold rounded-xl"
+                    >
+                      <Printer className="w-5 h-5" />
+                      Daabaco PDF / Print PDF
+                    </button>
+
+                    <div className="border-t border-gray-100 dark:border-gray-800/60 pt-4 flex flex-col gap-2">
+                      <span className="text-[10px] uppercase font-bold tracking-wider text-gray-400">Downloads</span>
+                      <button
+                        disabled={isReportLoading}
+                        onClick={triggerPdfGeneration}
+                        className="btn btn-secondary w-full py-2.5 flex items-center justify-center gap-2 cursor-pointer text-sm bg-slate-50 hover:bg-slate-100 dark:bg-slate-900 dark:hover:bg-slate-850 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 transition-all font-medium rounded-xl"
+                      >
+                        <Download className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                        Soo Dego PDF / Download PDF
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Summary Metric Bento Boxes */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="card bg-white dark:bg-[#1e293b] p-4 rounded-xl border border-gray-100 dark:border-gray-800">
+                      <span className="text-[10px] uppercase text-gray-400 font-bold block mb-1">Dugsi / Institute</span>
+                      <span className="text-sm font-bold text-gray-800 dark:text-white truncate block">{settings.schoolName}</span>
+                    </div>
+                    <div className="card bg-white dark:bg-[#1e293b] p-4 rounded-xl border border-gray-100 dark:border-gray-800">
+                      <span className="text-[10px] uppercase text-gray-400 font-bold block mb-1">Qaybta / Section</span>
+                      <span className="text-sm font-bold text-indigo-600 dark:text-indigo-400 capitalize block">{activeReportTab}</span>
+                    </div>
+                  </div>
                 </div>
 
-                <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm flex flex-col justify-between">
-                  <div>
-                    <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
-                      Financial Ledgers
-                    </h3>
-                    <p className="text-gray-400 dark:text-gray-500 text-sm mt-1.5 mb-6">
-                      Download all fee invoices and historical payment transactions.
-                    </p>
+                {/* Real-time A4 Letterhead Document Mockup Preview */}
+                <div className="lg:col-span-2">
+                  <div className="bg-white dark:bg-slate-900 rounded-3xl border border-gray-200/60 dark:border-gray-800 shadow-xl overflow-hidden p-8 space-y-6 max-h-[750px] overflow-y-auto relative font-sans text-slate-800 dark:text-slate-200">
+                    
+                    {/* Watermark badge for UI preview */}
+                    <div className="absolute top-4 right-4 select-none bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-100 dark:border-indigo-800 text-indigo-600 dark:text-indigo-400 text-[10px] font-black uppercase px-2 py-1 rounded-md tracking-widest">
+                      Report Preview
+                    </div>
+
+                    {/* Official Letterhead Header */}
+                    <div className="flex justify-between items-start border-b border-gray-100 dark:border-gray-800 pb-5">
+                      <div>
+                        <div className="text-xl font-extrabold text-indigo-600 dark:text-indigo-400 flex items-center gap-1 font-heading">
+                          🏫 {settings.schoolName}
+                        </div>
+                        <p className="text-[10px] text-gray-400 dark:text-gray-500 font-medium mt-1 uppercase tracking-wider">
+                          Nidaamka Rasmiga Ah ee Maamulka Dugsiga
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <h4 className="text-sm font-black text-slate-800 dark:text-white uppercase tracking-tight">
+                          {activeReportTab === "students" && "Students Directory"}
+                          {activeReportTab === "attendance" && "Attendance Register"}
+                          {activeReportTab === "financials" && "Fees & Invoices Statement"}
+                        </h4>
+                        <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1">
+                          Taariikhda: {new Date().toLocaleDateString("en-US", { year: 'numeric', month: 'long', day: 'numeric' })}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Report Information Details Banner */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-slate-50 dark:bg-slate-950/35 p-4 rounded-xl border border-slate-100 dark:border-slate-800/80 text-xs text-slate-600 dark:text-slate-400">
+                      <div>
+                        <strong className="text-slate-800 dark:text-white block mb-2 font-bold font-heading">Xogta Dukumentiga / Meta:</strong>
+                        <p>Dugsi: <span className="font-semibold text-slate-800 dark:text-white">{settings.schoolName}</span></p>
+                        <p className="mt-1">Xaalada Nidaamka: <span className="font-semibold text-emerald-600 dark:text-emerald-400">Rasmiga (Active)</span></p>
+                      </div>
+                      <div>
+                        <strong className="text-slate-800 dark:text-white block mb-2 font-bold font-heading">Koobidda Xogta / Metrics Summary:</strong>
+                        {activeReportTab === "students" && (
+                          <>
+                            <p>Ardayda Diiwaangashan: <span className="font-semibold text-slate-800 dark:text-white">{students.length} Arday</span></p>
+                            <p className="mt-1">Ardayda firfircoon (Active): <span className="font-semibold text-slate-800 dark:text-white">{students.filter(s => s.status === 'active').length}</span></p>
+                          </>
+                        )}
+                        {activeReportTab === "attendance" && (
+                          <>
+                            <p>Maalmaha la calaamadeeyay: <span className="font-semibold text-slate-800 dark:text-white">{reportAttendanceData ? Object.keys(reportAttendanceData).length : 0} Maalmood</span></p>
+                            <p className="mt-1">Xiriirinta database: <span className="font-semibold text-emerald-600 dark:text-emerald-400">Healthy & Synchronized</span></p>
+                          </>
+                        )}
+                        {activeReportTab === "financials" && (
+                          <>
+                            <p>Wajibaadka Guud (Expected): <span className="font-semibold text-slate-800 dark:text-white">{settings.currency} {
+                              Object.keys(fees).reduce((sum, id) => sum + (fees[id] || []).reduce((s, inv) => s + Number(inv.amount), 0), 0).toLocaleString()
+                            }</span></p>
+                            <p className="mt-1">Guud ahaan lacagta la bixiyay (Collected): <span className="font-semibold text-emerald-600 dark:text-emerald-400">{settings.currency} {
+                              Object.keys(fees).reduce((sum, id) => sum + (fees[id] || []).reduce((s, inv) => s + Number(inv.paidAmount), 0), 0).toLocaleString()
+                            }</span></p>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Table of data */}
+                    <div className="border border-slate-100 dark:border-slate-800 rounded-xl overflow-hidden text-xs">
+                      {isReportLoading ? (
+                        <div className="p-12 text-center text-slate-400 flex flex-col items-center gap-2 justify-center">
+                          <span className="w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></span>
+                          <span>Soo roraya xogta maqnaanshaha...</span>
+                        </div>
+                      ) : activeReportTab === "students" ? (
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
+                              <th className="p-3">ID</th>
+                              <th className="p-3 font-heading">Full Name</th>
+                              <th className="p-3">Class</th>
+                              <th className="p-3">Gender</th>
+                              <th className="p-3">Phone</th>
+                              <th className="p-3">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {students.length === 0 ? (
+                              <tr><td colSpan={6} className="p-4 text-center text-gray-400">Eber arday ah ayaa diiwaangashan.</td></tr>
+                            ) : (
+                              students.slice(0, 15).map(s => (
+                                <tr key={s.id} className="border-b border-slate-50 dark:border-slate-800/30">
+                                  <td className="p-3 font-mono text-[10px]">{s.id.substring(0, 6).toUpperCase()}</td>
+                                  <td className="p-3 font-bold">{s.fullName}</td>
+                                  <td className="p-3">{s.class || "-"}</td>
+                                  <td className="p-3 capitalize">{s.gender || "Male"}</td>
+                                  <td className="p-3">{s.guardianPhone || "-"}</td>
+                                  <td className="p-3">
+                                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                      s.status === 'active' ? 'bg-emerald-50 text-emerald-600' : 'bg-red-50 text-red-600'
+                                    }`}>{s.status}</span>
+                                  </td>
+                                </tr>
+                              ))
+                            )}
+                            {students.length > 15 && (
+                              <tr className="bg-slate-50/50 dark:bg-slate-800/10">
+                                <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
+                                  + {students.length - 15} Arday oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      ) : activeReportTab === "attendance" ? (
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
+                              <th className="p-3 font-heading">Date</th>
+                              <th className="p-3">Enrolled Count</th>
+                              <th className="p-3">Present</th>
+                              <th className="p-3">Late</th>
+                              <th className="p-3">Absent</th>
+                              <th className="p-3">Rate %</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {!reportAttendanceData || Object.keys(reportAttendanceData).length === 0 ? (
+                              <tr><td colSpan={6} className="p-4 text-center text-gray-400 font-heading">Wax maqnaansho ah oo la calaamadeeyay wali lama helin.</td></tr>
+                            ) : (
+                              Object.keys(reportAttendanceData).sort().reverse().slice(0, 10).map(date => {
+                                const list = reportAttendanceData[date] || [];
+                                const present = list.filter((a: any) => a.status === "Present").length;
+                                const late = list.filter((a: any) => a.status === "Late").length;
+                                const absent = list.filter((a: any) => a.status === "Absent").length;
+                                const rate = list.length > 0 ? Math.round(((present + late) / list.length) * 100) : 100;
+                                return (
+                                  <tr key={date} className="border-b border-slate-50 dark:border-slate-800/30">
+                                    <td className="p-3 font-semibold">{date}</td>
+                                    <td className="p-3">{list.length}</td>
+                                    <td className="p-3 text-emerald-600">{present}</td>
+                                    <td className="p-3 text-amber-500">{late}</td>
+                                    <td className="p-3 text-red-500">{absent}</td>
+                                    <td className="p-3 font-bold text-indigo-600 dark:text-indigo-400">{rate}%</td>
+                                  </tr>
+                                );
+                              })
+                            )}
+                            {reportAttendanceData && Object.keys(reportAttendanceData).length > 10 && (
+                              <tr className="bg-slate-50/50 dark:bg-slate-800/10">
+                                <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
+                                  + {Object.keys(reportAttendanceData).length - 10} Maalmood oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      ) : (
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="bg-slate-50 dark:bg-slate-800/40 border-b border-slate-100 dark:border-slate-800 text-slate-500 font-semibold">
+                              <th className="p-3 font-heading">Month</th>
+                              <th className="p-3">Student Name</th>
+                              <th className="p-3">Amount Due</th>
+                              <th className="p-3">Paid</th>
+                              <th className="p-3">Balance Due</th>
+                              <th className="p-3">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(() => {
+                              const allInvoices: any[] = [];
+                              Object.keys(fees).forEach(sid => {
+                                (fees[sid] || []).forEach(inv => allInvoices.push(inv));
+                              });
+
+                              if (allInvoices.length === 0) {
+                                return <tr><td colSpan={6} className="p-4 text-center text-gray-400 font-heading">Wax invoices ah oo la diiwaangaliyay lama helin.</td></tr>;
+                              }
+
+                              return allInvoices.slice(0, 12).map((inv, idx) => {
+                                const remaining = inv.amount - inv.paidAmount;
+                                return (
+                                  <tr key={idx} className="border-b border-slate-50 dark:border-slate-800/30">
+                                    <td className="p-3 font-semibold text-slate-400">{inv.month} {inv.year}</td>
+                                    <td className="p-3 font-bold">{inv.studentName}</td>
+                                    <td className="p-3">{settings.currency} {inv.amount}</td>
+                                    <td className="p-3 text-emerald-600 font-semibold">{settings.currency} {inv.paidAmount}</td>
+                                    <td className="p-3 text-red-500 font-semibold">{settings.currency} {remaining}</td>
+                                    <td className="p-3">
+                                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                        inv.status === 'Paid' ? 'bg-emerald-50 text-emerald-600' :
+                                        inv.status === 'Unpaid' ? 'bg-red-50 text-red-600' : 'bg-amber-50 text-amber-600'
+                                      }`}>{inv.status}</span>
+                                    </td>
+                                  </tr>
+                                );
+                              });
+                            })()}
+                            {(() => {
+                              const totalInvoices = Object.keys(fees).reduce((sum, sid) => sum + (fees[sid] || []).length, 0);
+                              if (totalInvoices > 12) {
+                                return (
+                                  <tr className="bg-slate-50/50 dark:bg-slate-800/10">
+                                    <td colSpan={6} className="p-3 text-center text-slate-400 font-semibold">
+                                      + {totalInvoices - 12} Invoices oo kale (Guji "Daabaco PDF" si aad u aragto oo dhan)
+                                    </td>
+                                  </tr>
+                                );
+                              }
+                              return null;
+                            })()}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+
+                    {/* Official Signature Section */}
+                    <div className="flex justify-between items-center pt-8 border-t border-dashed border-gray-100 dark:border-gray-800/80 text-[11px] text-slate-400">
+                      <div>
+                        <div className="w-40 border-t border-gray-300 dark:border-gray-700/80 pt-2 text-center">
+                          Maamulaha Dugsiga / Principal
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="w-40 border-t border-gray-300 dark:border-gray-700/80 pt-2 text-center ml-auto font-heading">
+                          Saxeex & Shaambad / Stamp
+                        </div>
+                      </div>
+                    </div>
+
                   </div>
-                  <button
-                    onClick={() => exportData(fees, "financial_ledgers.json")}
-                    className="btn btn-secondary w-full flex items-center justify-center gap-2"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download Financials JSON
-                  </button>
                 </div>
+
               </div>
             </div>
           )}
 
           {/* VIEW: SETTINGS */}
           {currentView === "settings" && (
-            <div className="fade-in space-y-6">
+            <div className="fade-in space-y-6 text-gray-800 dark:text-gray-100 max-w-4xl mx-auto">
               <div className="topbar">
-                <h2 className="text-3xl font-bold text-gray-800 dark:text-white font-heading">
-                  System Settings & Database
+                <h2 className="text-3xl font-black text-gray-800 dark:text-white font-heading">
+                  Dejinta Nidaamka & Settings
                 </h2>
                 <p className="text-gray-400 dark:text-gray-500 text-sm">
-                  School config, currency symbol, default pricing, and factory tools
+                  Dejinta guud ee dugsiga, calaamadaha lacagaha, xeerarka maqnaanshaha iyo muuqaalka nidaamka.
                 </p>
               </div>
 
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="space-y-6">
                 
                 {/* School settings form */}
-                <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm lg:col-span-2 space-y-6">
-                  <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
-                    School Configuration
-                  </h3>
+                <div className="card bg-white dark:bg-[#1e293b] p-6 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm space-y-6">
+                  <div className="flex items-center gap-2 pb-2 border-b border-gray-100 dark:border-gray-800/80">
+                    <span className="text-xl">⚙️</span>
+                    <h3 className="text-lg font-bold text-gray-800 dark:text-white font-heading">
+                      School Configuration (Dejinta Guud)
+                    </h3>
+                  </div>
 
                   <form onSubmit={handleSettingsSubmit} className="space-y-4">
                     <div>
-                      <label className="block text-gray-400 text-xs font-semibold uppercase tracking-wider mb-1">
-                        School Name
+                      <label className="block text-gray-400 text-xs font-bold uppercase tracking-wider mb-1">
+                        School Name (Magaca Dugsiga)
                       </label>
                       <input
                         type="text"
@@ -1760,8 +2597,8 @@ export default function App() {
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       <div>
-                        <label className="block text-gray-400 text-xs font-semibold uppercase tracking-wider mb-1">
-                          Currency Symbol
+                        <label className="block text-gray-400 text-xs font-bold uppercase tracking-wider mb-1">
+                          Currency Symbol (Calaamada Lacagta)
                         </label>
                         <input
                           type="text"
@@ -1772,8 +2609,8 @@ export default function App() {
                         />
                       </div>
                       <div>
-                        <label className="block text-gray-400 text-xs font-semibold uppercase tracking-wider mb-1">
-                          Default Fee Amount
+                        <label className="block text-gray-400 text-xs font-bold uppercase tracking-wider mb-1">
+                          Default Fee Amount (Lacagta Bisha ee Ardayga)
                         </label>
                         <input
                           type="number"
@@ -1785,39 +2622,55 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div>
-                      <label className="block text-gray-400 text-xs font-semibold uppercase tracking-wider mb-1">
-                        Attendance Rule Mode
-                      </label>
-                      <select
-                        value={settings.attendanceRules}
-                        onChange={(e) => setSettings({ ...settings, attendanceRules: e.target.value })}
-                        className="form-input"
-                      >
-                        <option value="Strict">Strict Mode</option>
-                        <option value="Flexible">Flexible Mode</option>
-                      </select>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-gray-400 text-xs font-bold uppercase tracking-wider mb-1">
+                          Attendance Rule Mode (Xeerka Maqnaanshaha)
+                        </label>
+                        <select
+                          value={settings.attendanceRules}
+                          onChange={(e) => setSettings({ ...settings, attendanceRules: e.target.value })}
+                          className="form-input"
+                        >
+                          <option value="Strict">Strict Mode (Calculates all absence rate rules)</option>
+                          <option value="Flexible">Flexible Mode (Allows simple checks)</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-gray-400 text-xs font-bold uppercase tracking-wider mb-1">
+                          Default UI System Theme (Muuqaalka Nidaamka)
+                        </label>
+                        <select
+                          value={settings.systemTheme}
+                          onChange={(e) => setSettings({ ...settings, systemTheme: e.target.value })}
+                          className="form-input"
+                        >
+                          <option value="light">☀️ Light Theme (Default)</option>
+                          <option value="dark">🌙 Dark Theme</option>
+                        </select>
+                      </div>
                     </div>
 
                     <div className="pt-2">
-                      <button type="submit" className="btn btn-primary">
-                        Save Settings
+                      <button type="submit" className="btn btn-primary bg-[#4f46e5] text-white py-2.5 px-6 rounded-xl hover:bg-[#4338ca] font-semibold flex items-center gap-2 cursor-pointer transition-all">
+                        💾 Save Settings & Apply Changes
                       </button>
                     </div>
                   </form>
                 </div>
 
                 {/* Danger zone / factory reset */}
-                <div className="card border-red-200 dark:border-red-900/30 bg-red-50/10 dark:bg-red-950/5 p-6 rounded-2xl lg:col-span-3">
-                  <h4 className="text-red-600 dark:text-red-400 font-bold text-sm uppercase tracking-wider mb-2">
-                    Danger Zone
+                <div className="card border-red-200 dark:border-red-950/40 bg-red-50/10 dark:bg-red-950/5 p-6 rounded-2xl space-y-3">
+                  <h4 className="text-red-600 dark:text-red-400 font-bold text-sm uppercase tracking-wider">
+                    Danger Zone (Goobta Khatarta)
                   </h4>
-                  <p className="text-xs text-gray-400 dark:text-gray-500 mb-4">
-                    Wipe all local fallback records to reset system state back to default factory settings.
+                  <p className="text-xs text-gray-400 dark:text-gray-500 leading-relaxed">
+                    Tirtir dhammaan xogta maxalliga ah si aad ugu celiso nidaamka xaaladdiisa warshadda. Tani waxay meesha ka saaraysaa ardayda, lacagaha, iyo xogta maqnaanshaha.
                   </p>
                   <button
                     onClick={handleFactoryReset}
-                    className="btn bg-red-600 hover:bg-red-700 text-white font-semibold text-xs py-2 px-4 rounded-lg"
+                    className="btn bg-red-600 hover:bg-red-700 text-white font-semibold text-xs py-2.5 px-5 rounded-xl cursor-pointer transition-all"
                   >
                     Factory Reset All Data
                   </button>

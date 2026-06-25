@@ -4,11 +4,129 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
+import nodemailer from "nodemailer";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
+// In-memory OTP store for email verification
+interface OtpEntry {
+  otp: string;
+  password?: string;
+  name?: string;
+  expiresAt: number;
+  mode: "login" | "signup";
+}
+const otpStore = new Map<string, OtpEntry>();
+
+// Helper to send email with OTP
+async function sendOtpEmail(email: string, otp: string, mode: "login" | "signup", name?: string): Promise<{ sent: boolean; error?: string }> {
+  const host = process.env.SMTP_HOST;
+  const port = parseInt(process.env.SMTP_PORT || "465", 10);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || user || "School Manager Pro <no-reply@schoolmanagerpro.com>";
+
+  const displayModeName = mode === "signup" ? "Sajilaad (Registration)" : "Galaangal (Login)";
+  const somaliMessage = mode === "signup"
+    ? `Ku soo dhawaada School Manager Pro, ${name || "Macallin"}. Fadlan isticmaal code-ka hoose si aad u xaqiijiso email-kaaga oo aad u dhammaystirto diiwaangelinta.`
+    : `Fadlan isticmaal code-ka hoose si aad u xaqiijiso aqoonsigaaga oo aad u gasho nidaamka.`;
+
+  const englishMessage = mode === "signup"
+    ? `Welcome to School Manager Pro, ${name || "Teacher"}. Please use the code below to verify your email and complete your registration.`
+    : `Please use the code below to verify your identity and access the system.`;
+
+  const htmlContent = `
+    <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+      <div style="text-align: center; margin-bottom: 24px;">
+        <div style="display: inline-block; background-color: #4f46e5; color: white; padding: 10px 16px; border-radius: 8px; font-weight: bold; font-size: 20px;">
+          🏫 School Manager Pro
+        </div>
+      </div>
+      
+      <h2 style="color: #0f172a; text-align: center; font-size: 22px; margin-bottom: 8px;">Xaqiijinta Emailka / Email Verification</h2>
+      <p style="color: #475569; text-align: center; font-size: 14px; margin-top: 0;">Habka: <strong>${displayModeName}</strong></p>
+      
+      <hr style="border: 0; border-top: 1px solid #f1f5f9; margin: 20px 0;" />
+      
+      <!-- Somali Version -->
+      <div style="background-color: #f8fafc; padding: 16px; border-radius: 8px; margin-bottom: 16px; border-left: 4px solid #4f46e5;">
+        <p style="color: #1e293b; font-size: 15px; line-height: 1.5; margin: 0;">
+          <strong>Soomaali:</strong><br/>
+          ${somaliMessage}
+        </p>
+      </div>
+
+      <!-- English Version -->
+      <div style="background-color: #f8fafc; padding: 16px; border-radius: 8px; margin-bottom: 24px; border-left: 4px solid #6366f1;">
+        <p style="color: #1e293b; font-size: 15px; line-height: 1.5; margin: 0;">
+          <strong>English:</strong><br/>
+          ${englishMessage}
+        </p>
+      </div>
+      
+      <div style="text-align: center; margin: 30px 0;">
+        <div style="display: inline-block; background-color: #f1f5f9; border: 2px dashed #cbd5e1; border-radius: 12px; padding: 12px 30px;">
+          <span style="font-family: monospace; font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #4f46e5;">${otp}</span>
+        </div>
+        <p style="color: #94a3b8; font-size: 12px; margin-top: 8px;">Muddada uu shaqaynayo waa 10 daqiiqo / Valid for 10 minutes</p>
+      </div>
+      
+      <hr style="border: 0; border-top: 1px solid #f1f5f9; margin: 20px 0;" />
+      
+      <p style="color: #64748b; font-size: 12px; text-align: center; line-height: 1.5; margin: 0;">
+        Haddii aadan adigu codsan, fadlan iska indho-tir email-kan.<br/>
+        If you did not request this, please ignore this email.
+      </p>
+    </div>
+  `;
+
+  const textContent = `
+    School Manager Pro - Email Verification
+    Mode / Habka: ${displayModeName}
+    
+    SOMALI:
+    ${somaliMessage}
+    Code: ${otp}
+    
+    ENGLISH:
+    ${englishMessage}
+    Code: ${otp}
+    
+    This code is valid for 10 minutes.
+  `;
+
+  if (host && user && pass) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host,
+        port,
+        secure: port === 465,
+        auth: { user, pass }
+      });
+
+      await transporter.sendMail({
+        from,
+        to: email,
+        subject: `[School Manager Pro] Verification Code: ${otp}`,
+        text: textContent,
+        html: htmlContent
+      });
+
+      console.log(`Successfully sent OTP email to ${email}`);
+      return { sent: true };
+    } catch (err: any) {
+      console.error("Error sending real SMTP email:", err);
+      return { sent: false, error: err.message || "SMTP sending failed" };
+    }
+  } else {
+    console.log(`[DEV MODE] SMTP not configured. OTP for ${email} is ${otp}`);
+    return { sent: false, error: "SMTP not configured" };
+  }
+}
+
 
 app.use(express.json());
 
@@ -220,110 +338,198 @@ app.get("/api/status", async (req, res) => {
   });
 });
 
-// POST Auth SignUp
-app.post("/api/auth/signup", async (req, res) => {
-  const { email, password, name } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required!" });
-  }
+// Helper to validate email format
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function isValidEmailAddress(email: string): boolean {
+  return emailRegex.test(email);
+}
 
-  const id = "u-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
-  const createdAt = new Date().toISOString();
-
-  const newUser = {
-    id,
-    email: email.trim().toLowerCase(),
-    password, // Plain text for simplicity, in a real system we would hash it but client-to-server plain text is fine for this setup
-    name: name ? name.trim() : "",
-    createdAt
-  };
-
-  if (isSupabaseConfigured && supabase) {
-    try {
-      // Check if user exists
-      const { data: existing, error: checkErr } = await supabase.from("users").select("id").eq("email", newUser.email).maybeSingle();
-      if (existing) {
-        return res.status(400).json({ error: "This email is already registered!" });
-      }
-
-      const { error } = await supabase.from("users").insert({
-        id: newUser.id,
-        email: newUser.email,
-        password: newUser.password,
-        name: newUser.name,
-        created_at: newUser.createdAt
-      });
-
-      if (!error) {
-        return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
-      }
-      console.warn("Supabase auth insert error:", error);
-    } catch (err) {
-      console.error("Supabase auth failed:", err);
-    }
-  }
-
-  // Fallback
-  const local = loadLocalData();
-  if (!local.users) local.users = [];
+// POST Send OTP
+app.post("/api/auth/send-otp", async (req, res) => {
+  const { email, password, name, mode } = req.body;
   
-  const existingLocal = local.users.find(u => u.email === newUser.email);
-  if (existingLocal) {
-    return res.status(400).json({ error: "This email is already registered!" });
-  }
-
-  local.users.push(newUser);
-  saveLocalData(local);
-  res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
-});
-
-// POST Auth Login
-app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required!" });
+  if (!email || !password || !mode) {
+    return res.status(400).json({ error: "Email, password, and mode are required!" });
   }
 
   const searchEmail = email.trim().toLowerCase();
 
+  // Validate email format
+  if (!isValidEmailAddress(searchEmail) && searchEmail !== "admin") {
+    return res.status(400).json({ error: "Fadlan geli email sax ah! / Please enter a valid email address!" });
+  }
+
+  // Check user existence
+  let userExists = false;
+  let correctPassword = false;
+  let existingUser: any = null;
+
   if (isSupabaseConfigured && supabase) {
     try {
       const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
-      if (error) {
-        console.warn("Supabase auth login error:", error);
-      } else if (data) {
-        if (data.password === password) {
-          return res.json({ success: true, user: { id: data.id, email: data.email, name: data.name } });
-        } else {
-          return res.status(400).json({ error: "Incorrect password!" });
-        }
+      if (!error && data) {
+        userExists = true;
+        existingUser = data;
+        correctPassword = data.password === password;
       }
     } catch (err) {
-      console.error("Supabase login exception:", err);
+      console.error("Supabase check user failed:", err);
     }
   }
 
-  // Fallback
-  const local = loadLocalData();
-  if (!local.users) local.users = [];
-
-  const found = local.users.find(u => u.email === searchEmail);
-  if (found) {
-    if (found.password === password) {
-      return res.json({ success: true, user: { id: found.id, email: found.email, name: found.name } });
-    } else {
-      return res.status(400).json({ error: "Incorrect password!" });
+  // Local fallback check
+  if (!userExists) {
+    const local = loadLocalData();
+    const found = (local.users || []).find(u => u.email === searchEmail);
+    if (found) {
+      userExists = true;
+      existingUser = found;
+      correctPassword = found.password === password;
     }
   }
 
-  // Support fallback to original admin/123 if no user database setup
-  if (searchEmail === "admin" || searchEmail === "admin@dugsiga.com") {
-    if (password === "123") {
-      return res.json({ success: true, user: { id: "admin", email: "admin@dugsiga.com", name: "Admin" } });
+  // Special Admin check for development/demo
+  if (!userExists && (searchEmail === "admin" || searchEmail === "admin@dugsiga.com")) {
+    userExists = true;
+    correctPassword = password === "123";
+    existingUser = { id: "admin", email: "admin@dugsiga.com", name: "Admin", password: "123" };
+  }
+
+  // Validation based on mode
+  if (mode === "signup") {
+    if (userExists) {
+      return res.status(400).json({ error: "Email-kan mar horey ayaa loo diiwaangeliyey! / This email is already registered!" });
+    }
+  } else if (mode === "login") {
+    if (!userExists) {
+      return res.status(400).json({ error: "Email-kan ma diiwaangashna! / No user registered with this email!" });
+    }
+    if (!correctPassword) {
+      return res.status(400).json({ error: "Erayga sirta ah waa khalad! / Incorrect password!" });
     }
   }
 
-  res.status(400).json({ error: "No user registered with this email!" });
+  // Generate 6-digit OTP code
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+  otpStore.set(searchEmail, {
+    otp,
+    password,
+    name: name ? name.trim() : (existingUser ? existingUser.name : ""),
+    expiresAt,
+    mode
+  });
+
+  // Send email
+  const emailResult = await sendOtpEmail(searchEmail, otp, mode, name);
+  const smtpConfigured = emailResult.sent;
+
+  res.json({
+    success: true,
+    message: smtpConfigured 
+      ? "Code-ka xaqiijinta ayaa loo diray emailkaaga! / Verification code sent to your email!" 
+      : "Code-ka xaqiijinta ayaa la soo saaray! (Habka tijaabada) / Verification code generated! (Dev mode)",
+    smtpConfigured,
+    devOtp: smtpConfigured ? undefined : otp
+  });
+});
+
+// POST Verify OTP and complete Auth
+app.post("/api/auth/verify-otp", async (req, res) => {
+  const { email, otp, mode } = req.body;
+
+  if (!email || !otp || !mode) {
+    return res.status(400).json({ error: "Email, OTP code, and mode are required!" });
+  }
+
+  const searchEmail = email.trim().toLowerCase();
+  const entry = otpStore.get(searchEmail);
+
+  if (!entry) {
+    return res.status(400).json({ error: "Ma jiro code loo diray email-kan! / No code was sent to this email!" });
+  }
+
+  if (Date.now() > entry.expiresAt) {
+    otpStore.delete(searchEmail);
+    return res.status(400).json({ error: "Code-kii xaqiijinta wuu dhacay! / Verification code has expired!" });
+  }
+
+  if (entry.otp !== otp.trim()) {
+    return res.status(400).json({ error: "Code-ku waa khalad! / Incorrect verification code!" });
+  }
+
+  // Clean up the OTP store
+  otpStore.delete(searchEmail);
+
+  // If we reach here, OTP is correct! Now complete the action.
+  if (mode === "signup") {
+    const id = "u-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
+    const createdAt = new Date().toISOString();
+
+    const newUser = {
+      id,
+      email: searchEmail,
+      password: entry.password,
+      name: entry.name || "",
+      createdAt
+    };
+
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { error } = await supabase.from("users").insert({
+          id: newUser.id,
+          email: newUser.email,
+          password: newUser.password,
+          name: newUser.name,
+          created_at: newUser.createdAt
+        });
+
+        if (!error) {
+          return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
+        }
+        console.warn("Supabase auth signup insert error:", error);
+      } catch (err) {
+        console.error("Supabase auth signup failed:", err);
+      }
+    }
+
+    // Local fallback
+    const local = loadLocalData();
+    if (!local.users) local.users = [];
+    local.users.push(newUser);
+    saveLocalData(local);
+    return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
+  } else {
+    // login mode - Fetch and return user info
+    let foundUser: any = null;
+
+    if (isSupabaseConfigured && supabase) {
+      try {
+        const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
+        if (!error && data) {
+          foundUser = data;
+        }
+      } catch (err) {
+        console.error("Supabase login fetch failed:", err);
+      }
+    }
+
+    if (!foundUser) {
+      const local = loadLocalData();
+      foundUser = (local.users || []).find(u => u.email === searchEmail);
+    }
+
+    if (!foundUser && (searchEmail === "admin" || searchEmail === "admin@dugsiga.com")) {
+      foundUser = { id: "admin", email: "admin@dugsiga.com", name: "Admin" };
+    }
+
+    if (foundUser) {
+      return res.json({ success: true, user: { id: foundUser.id, email: foundUser.email, name: foundUser.name } });
+    }
+
+    return res.status(404).json({ error: "User not found!" });
+  }
 });
 
 // Helper to extract Tenant/User ID from Request Headers for Multi-tenancy
@@ -539,10 +745,14 @@ app.delete("/api/students/:id", async (req, res) => {
   res.json({ success: true, message: "Student and all records deleted locally" });
 });
 
-// GET Attendance for a specific date
+// GET Attendance for a specific date and optional session
 app.get("/api/attendance", async (req, res) => {
   const tenantId = getTenantId(req);
-  const date = (req.query.date as string) || new Date().toISOString().split("T")[0];
+  const rawDate = (req.query.date as string) || new Date().toISOString().split("T")[0];
+  const session = (req.query.session as string) || "";
+  
+  // Combine date and session if session is provided to support multiple attendances per day
+  const date = session ? `${rawDate}_${session}` : rawDate;
 
   if (isSupabaseConfigured && supabase) {
     try {
@@ -611,8 +821,11 @@ app.get("/api/attendance/all", async (req, res) => {
 // POST Save Batch Attendance
 app.post("/api/attendance/batch", async (req, res) => {
   const tenantId = getTenantId(req);
-  const { date, records } = req.body; // records: [{ studentId, status }]
+  const { date: rawDate, session, records } = req.body; // records: [{ studentId, status }]
   const timestamp = new Date().toISOString();
+
+  // Combine date and session to support taking attendance twice a day
+  const date = session ? `${rawDate}_${session}` : rawDate;
 
   // Deduplicate records array to prevent multiple entries for the same student on the same day
   const seenStudents = new Set<string>();
@@ -1008,6 +1221,58 @@ app.post("/api/settings", async (req, res) => {
   local.schoolSettings[tenantId] = { schoolName, currency, feeAmount, attendanceRules, systemTheme };
   saveLocalData(local);
   res.json(local.schoolSettings[tenantId]);
+});
+
+// POST Send Test SMTP Email
+app.post("/api/settings/test-email", async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: "Email is required!" });
+  }
+
+  const host = process.env.SMTP_HOST;
+  const port = parseInt(process.env.SMTP_PORT || "465", 10);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM || user || "School Manager Pro <no-reply@schoolmanagerpro.com>";
+
+  if (!host || !user || !pass) {
+    return res.status(400).json({ 
+      error: "SMTP server is not configured in .env variables yet! Please set SMTP_HOST, SMTP_USER, and SMTP_PASS first.",
+      smtpConfigured: false 
+    });
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      auth: { user, pass }
+    });
+
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
+        <h2 style="color: #4f46e5;">📬 Email-ka Tijaabada SMTP (Test SMTP Email)</h2>
+        <p>Hambalyo! Isku xirkaaga SMTP ee School Pro wuu guulaystay.</p>
+        <p>Congratulations! Your SMTP email service is successfully configured and working correctly in <strong>School Pro</strong>.</p>
+        <hr style="border: 0; border-top: 1px solid #f1f5f9; margin: 20px 0;" />
+        <p style="font-size: 11px; color: #94a3b8;">School Pro Service Alert • ${new Date().toLocaleString()}</p>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from,
+      to: email,
+      subject: `[School Pro] SMTP Email Test: Successful!`,
+      html: htmlContent
+    });
+
+    res.json({ success: true, message: "Email-ka tijaabada ah si guul leh ayaa loo soo diray! / Test email sent successfully!" });
+  } catch (err: any) {
+    console.error("Test SMTP failed:", err);
+    res.status(500).json({ error: err.message || "Failed to send SMTP email." });
+  }
 });
 
 // Vite middleware setup for Development vs Production
