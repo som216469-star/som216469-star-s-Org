@@ -495,11 +495,52 @@ app.post("/api/auth/verify-otp", requireOnlineDatabase, async (req, res) => {
   otpStore.delete(searchEmail);
 
   if (mode === "signup") {
-    const id = "u-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
+    // 1. Sign up the user in Supabase Auth to get a real Auth User ID (UUID)
+    let authUserId: string | null = null;
+    try {
+      const { data: authData, error: authError } = await supabase.auth.signUp({
+        email: searchEmail,
+        password: entry.password,
+        options: {
+          data: {
+            name: entry.name || ""
+          }
+        }
+      });
+
+      if (authError) {
+        if (authError.message.includes("already registered") || authError.status === 400 || authError.status === 422) {
+          // Attempt to sign in to retrieve their existing auth user ID
+          const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+            email: searchEmail,
+            password: entry.password
+          });
+          if (!signInError && signInData?.user) {
+            authUserId = signInData.user.id;
+          } else {
+            return res.status(400).json({ 
+              error: `Macaamiilkan mar horey ayaa loo diiwaangeliyey Auth laakiin ma geli karno: ${signInError?.message || authError.message}` 
+            });
+          }
+        } else {
+          return res.status(400).json({ error: `Diiwaangelinta Supabase Auth waa fashilantay: ${authError.message}` });
+        }
+      } else {
+        authUserId = authData.user?.id || null;
+      }
+    } catch (authErr: any) {
+      console.error("Supabase Auth signUp exception:", authErr);
+      return res.status(500).json({ error: `Cilad ku dhacday dhismaha account-ka: ${authErr.message || authErr}` });
+    }
+
+    if (!authUserId) {
+      return res.status(500).json({ error: "Ma helin ID-ga guud ee aqoonsiga! / Failed to retrieve user ID from Auth." });
+    }
+
     const createdAt = new Date().toISOString();
 
     const newUser = {
-      id,
+      id: authUserId,
       email: searchEmail,
       password: entry.password,
       name: entry.name || "",
@@ -516,7 +557,7 @@ app.post("/api/auth/verify-otp", requireOnlineDatabase, async (req, res) => {
       });
 
       if (error) {
-        return res.status(500).json({ error: `Supabase signup failed: ${error.message}` });
+        return res.status(500).json({ error: `Supabase public.users insertion failed: ${error.message}` });
       }
 
       return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
