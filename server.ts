@@ -220,6 +220,14 @@ function saveLocalData(data: LocalData) {
 let SUPABASE_URL = (process.env.SUPABASE_URL || "").trim().replace(/^["']|["']$/g, "").trim();
 let SUPABASE_KEY = (process.env.SUPABASE_KEY || "").trim().replace(/^["']|["']$/g, "").trim();
 
+// Normalize Supabase URL if it's a project ref (e.g. "qvbqzfxweyrkzmjmhoas") instead of a full URL
+if (SUPABASE_URL && !SUPABASE_URL.startsWith("http://") && !SUPABASE_URL.startsWith("https://")) {
+  if (/^[a-z0-9]{10,40}$/i.test(SUPABASE_URL)) {
+    SUPABASE_URL = `https://${SUPABASE_URL}.supabase.co`;
+    console.log("Normalized Supabase URL from project ref to:", SUPABASE_URL);
+  }
+}
+
 // Additional validation to prevent "Invalid supabaseUrl" errors
 const isValidUrl = (url: string) => {
   try {
@@ -242,8 +250,18 @@ if (SUPABASE_URL && SUPABASE_KEY && isValidUrl(SUPABASE_URL) && SUPABASE_URL !==
     console.error("Failed to initialize Supabase client:", err);
   }
 } else {
-  console.log("Supabase not configured or invalid URL. Falling back to local data.json storage. URL:", SUPABASE_URL);
+  console.log("Supabase not configured or invalid URL. Online database strictly required! URL:", SUPABASE_URL);
 }
+
+// Middleware to enforce online database availability (removes local data.json fallbacks)
+const requireOnlineDatabase = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!isSupabaseConfigured || !supabase) {
+    return res.status(400).json({
+      error: "Ma jiro database online ah oo la helay! Fadlan hubi configuration-ka Supabase. / No online database was found! Please check your Supabase configuration."
+    });
+  }
+  next();
+};
 
 // SQL Script for setup to display in UI
 const SQL_SCHEMA = `-- Create Users table for authentication
@@ -344,7 +362,7 @@ function isValidEmailAddress(email: string): boolean {
 }
 
 // POST Send OTP
-app.post("/api/auth/send-otp", async (req, res) => {
+app.post("/api/auth/send-otp", requireOnlineDatabase, async (req, res) => {
   const { email, password, name, mode } = req.body;
   
   if (!email || !password || !mode) {
@@ -358,36 +376,26 @@ app.post("/api/auth/send-otp", async (req, res) => {
     return res.status(400).json({ error: "Fadlan geli email sax ah! / Please enter a valid email address!" });
   }
 
-  // Check user existence
+  // Check user existence in Supabase
   let userExists = false;
   let correctPassword = false;
   let existingUser: any = null;
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
-      if (!error && data) {
-        userExists = true;
-        existingUser = data;
-        correctPassword = data.password === password;
-      }
-    } catch (err) {
-      console.error("Supabase check user failed:", err);
+  try {
+    const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: `Supabase database error: ${error.message}` });
     }
-  }
-
-  // Local fallback check
-  if (!userExists) {
-    const local = loadLocalData();
-    const found = (local.users || []).find(u => u.email === searchEmail);
-    if (found) {
+    if (data) {
       userExists = true;
-      existingUser = found;
-      correctPassword = found.password === password;
+      existingUser = data;
+      correctPassword = data.password === password;
     }
+  } catch (err: any) {
+    return res.status(500).json({ error: `Supabase request failed: ${err.message || err}` });
   }
 
-  // Special Admin check for development/demo
+  // Special Admin check for development/demo (if they want an admin option)
   if (!userExists && (searchEmail === "admin" || searchEmail === "admin@dugsiga.com")) {
     userExists = true;
     correctPassword = password === "123";
@@ -435,7 +443,7 @@ app.post("/api/auth/send-otp", async (req, res) => {
 });
 
 // POST Verify OTP and complete Auth
-app.post("/api/auth/verify-otp", async (req, res) => {
+app.post("/api/auth/verify-otp", requireOnlineDatabase, async (req, res) => {
   const { email, otp, mode } = req.body;
 
   if (!email || !otp || !mode) {
@@ -461,7 +469,6 @@ app.post("/api/auth/verify-otp", async (req, res) => {
   // Clean up the OTP store
   otpStore.delete(searchEmail);
 
-  // If we reach here, OTP is correct! Now complete the action.
   if (mode === "signup") {
     const id = "u-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
     const createdAt = new Date().toISOString();
@@ -474,49 +481,37 @@ app.post("/api/auth/verify-otp", async (req, res) => {
       createdAt
     };
 
-    if (isSupabaseConfigured && supabase) {
-      try {
-        const { error } = await supabase.from("users").insert({
-          id: newUser.id,
-          email: newUser.email,
-          password: newUser.password,
-          name: newUser.name,
-          created_at: newUser.createdAt
-        });
+    try {
+      const { error } = await supabase.from("users").insert({
+        id: newUser.id,
+        email: newUser.email,
+        password: newUser.password,
+        name: newUser.name,
+        created_at: newUser.createdAt
+      });
 
-        if (!error) {
-          return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
-        }
-        console.warn("Supabase auth signup insert error:", error);
-      } catch (err) {
-        console.error("Supabase auth signup failed:", err);
+      if (error) {
+        return res.status(500).json({ error: `Supabase signup failed: ${error.message}` });
       }
-    }
 
-    // Local fallback
-    const local = loadLocalData();
-    if (!local.users) local.users = [];
-    local.users.push(newUser);
-    saveLocalData(local);
-    return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
+      return res.json({ success: true, user: { id: newUser.id, email: newUser.email, name: newUser.name } });
+    } catch (err: any) {
+      return res.status(500).json({ error: `Database error: ${err.message || err}` });
+    }
   } else {
     // login mode - Fetch and return user info
     let foundUser: any = null;
 
-    if (isSupabaseConfigured && supabase) {
-      try {
-        const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
-        if (!error && data) {
-          foundUser = data;
-        }
-      } catch (err) {
-        console.error("Supabase login fetch failed:", err);
+    try {
+      const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
+      if (error) {
+        return res.status(500).json({ error: `Supabase login failed: ${error.message}` });
       }
-    }
-
-    if (!foundUser) {
-      const local = loadLocalData();
-      foundUser = (local.users || []).find(u => u.email === searchEmail);
+      if (data) {
+        foundUser = data;
+      }
+    } catch (err: any) {
+      return res.status(500).json({ error: `Database error: ${err.message || err}` });
     }
 
     if (!foundUser && (searchEmail === "admin" || searchEmail === "admin@dugsiga.com")) {
@@ -541,37 +536,31 @@ function getTenantId(req: express.Request): string {
 }
 
 // GET Students
-app.get("/api/students", async (req, res) => {
+app.get("/api/students", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase.from("students").select("*").eq("user_id", tenantId).order("full_name", { ascending: true });
-      if (!error) {
-        // Map Supabase columns to camelCase expected by front-end
-        const mapped = (data || []).map((s: any) => ({
-          id: s.id,
-          fullName: s.full_name,
-          class: s.class,
-          gender: s.gender,
-          guardianPhone: s.guardian_phone,
-          status: s.status,
-          createdAt: s.created_at
-        }));
-        return res.json(mapped);
-      }
-      console.warn("Supabase query error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase request failed, falling back to local:", err);
+  try {
+    const { data, error } = await supabase.from("students").select("*").eq("user_id", tenantId).order("full_name", { ascending: true });
+    if (error) {
+      return res.status(500).json({ error: `Supabase query error: ${error.message}` });
     }
+    // Map Supabase columns to camelCase expected by front-end
+    const mapped = (data || []).map((s: any) => ({
+      id: s.id,
+      fullName: s.full_name,
+      class: s.class,
+      gender: s.gender,
+      guardianPhone: s.guardian_phone,
+      status: s.status,
+      createdAt: s.created_at
+    }));
+    return res.json(mapped);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-  
-  const local = loadLocalData();
-  const filtered = (local.students || []).filter((s: any) => s.userId === tenantId || s.user_id === tenantId);
-  res.json(filtered);
 });
 
 // POST Student
-app.post("/api/students", async (req, res) => {
+app.post("/api/students", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const { fullName, class: className, gender, guardianPhone, status } = req.body;
   
@@ -582,76 +571,59 @@ app.post("/api/students", async (req, res) => {
     return res.status(400).json({ error: "Student name and class are required." });
   }
 
-  // Check for duplicate student
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data: existing, error: checkError } = await supabase
-        .from("students")
-        .select("id")
-        .eq("user_id", tenantId)
-        .ilike("full_name", normalizedName)
-        .ilike("class", normalizedClass);
-      
-      if (!checkError && existing && existing.length > 0) {
-        return res.status(400).json({ error: `A student named "${normalizedName}" already exists in class "${normalizedClass}".` });
-      }
-    } catch (err) {
-      console.error("Supabase duplicate check failed:", err);
+  try {
+    // Check duplicate
+    const { data: existing, error: checkError } = await supabase
+      .from("students")
+      .select("id")
+      .eq("user_id", tenantId)
+      .ilike("full_name", normalizedName)
+      .ilike("class", normalizedClass);
+    
+    if (checkError) {
+      return res.status(500).json({ error: `Database check failed: ${checkError.message}` });
     }
-  }
-
-  const local = loadLocalData();
-  const isDuplicate = (local.students || []).some((s: any) => 
-    (s.userId === tenantId || s.user_id === tenantId) &&
-    s.fullName.toLowerCase().trim() === normalizedName.toLowerCase() &&
-    s.class.toLowerCase().trim() === normalizedClass.toLowerCase()
-  );
-  if (isDuplicate) {
-    return res.status(400).json({ error: `A student named "${normalizedName}" already exists in class "${normalizedClass}".` });
-  }
-
-  const id = "s-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
-  const createdAt = new Date().toISOString().split("T")[0];
-
-  const newStudent = {
-    id,
-    userId: tenantId,
-    fullName: normalizedName,
-    class: normalizedClass,
-    gender,
-    guardianPhone,
-    status: status || "active",
-    createdAt
-  };
-
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { error } = await supabase.from("students").insert({
-        id: newStudent.id,
-        user_id: tenantId,
-        full_name: newStudent.fullName,
-        class: newStudent.class,
-        gender: newStudent.gender,
-        guardian_phone: newStudent.guardianPhone,
-        status: newStudent.status,
-        created_at: newStudent.createdAt
-      });
-      if (!error) {
-        return res.json(newStudent);
-      }
-      console.warn("Supabase insert error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase insert failed, falling back to local:", err);
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: `A student named "${normalizedName}" already exists in class "${normalizedClass}".` });
     }
-  }
 
-  local.students.push(newStudent);
-  saveLocalData(local);
-  res.json(newStudent);
+    const id = "s-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
+    const createdAt = new Date().toISOString().split("T")[0];
+
+    const newStudent = {
+      id,
+      userId: tenantId,
+      fullName: normalizedName,
+      class: normalizedClass,
+      gender,
+      guardianPhone,
+      status: status || "active",
+      createdAt
+    };
+
+    const { error } = await supabase.from("students").insert({
+      id: newStudent.id,
+      user_id: tenantId,
+      full_name: newStudent.fullName,
+      class: newStudent.class,
+      gender: newStudent.gender,
+      guardian_phone: newStudent.guardianPhone,
+      status: newStudent.status,
+      created_at: newStudent.createdAt
+    });
+
+    if (error) {
+      return res.status(500).json({ error: `Supabase insert failed: ${error.message}` });
+    }
+
+    return res.json(newStudent);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
+  }
 });
 
 // PUT Student
-app.put("/api/students/:id", async (req, res) => {
+app.put("/api/students/:id", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const { id } = req.params;
   const { fullName, class: className, gender, guardianPhone, status } = req.body;
@@ -663,170 +635,109 @@ app.put("/api/students/:id", async (req, res) => {
     return res.status(400).json({ error: "Student name and class are required." });
   }
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data: existing, error: checkError } = await supabase
-        .from("students")
-        .select("id")
-        .eq("user_id", tenantId)
-        .ilike("full_name", normalizedName)
-        .ilike("class", normalizedClass)
-        .neq("id", id);
-      
-      if (!checkError && existing && existing.length > 0) {
-        return res.status(400).json({ error: `A student named "${normalizedName}" already exists in class "${normalizedClass}".` });
-      }
-
-      const { error } = await supabase.from("students").update({
-        full_name: normalizedName,
-        class: normalizedClass,
-        gender,
-        guardian_phone: guardianPhone,
-        status
-      }).eq("id", id).eq("user_id", tenantId);
-
-      if (!error) {
-        return res.json({ id, fullName: normalizedName, class: normalizedClass, gender, guardianPhone, status });
-      }
-      console.warn("Supabase update error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase update failed, falling back to local:", err);
+  try {
+    const { data: existing, error: checkError } = await supabase
+      .from("students")
+      .select("id")
+      .eq("user_id", tenantId)
+      .ilike("full_name", normalizedName)
+      .ilike("class", normalizedClass)
+      .neq("id", id);
+    
+    if (checkError) {
+      return res.status(500).json({ error: `Database check failed: ${checkError.message}` });
     }
-  }
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: `A student named "${normalizedName}" already exists in class "${normalizedClass}".` });
+    }
 
-  const local = loadLocalData();
-  const isDuplicate = (local.students || []).some((s: any) => 
-    (s.userId === tenantId || s.user_id === tenantId) &&
-    s.id !== id &&
-    s.fullName.toLowerCase().trim() === normalizedName.toLowerCase() &&
-    s.class.toLowerCase().trim() === normalizedClass.toLowerCase()
-  );
-  if (isDuplicate) {
-    return res.status(400).json({ error: `A student named "${normalizedName}" already exists in class "${normalizedClass}".` });
-  }
+    const { error } = await supabase.from("students").update({
+      full_name: normalizedName,
+      class: normalizedClass,
+      gender,
+      guardian_phone: guardianPhone,
+      status
+    }).eq("id", id).eq("user_id", tenantId);
 
-  const idx = local.students.findIndex(s => s.id === id && (s.userId === tenantId || s.user_id === tenantId));
-  if (idx > -1) {
-    local.students[idx] = { ...local.students[idx], fullName: normalizedName, class: normalizedClass, gender, guardianPhone, status };
-    saveLocalData(local);
-    return res.json(local.students[idx]);
+    if (error) {
+      return res.status(500).json({ error: `Supabase update failed: ${error.message}` });
+    }
+
+    return res.json({ id, fullName: normalizedName, class: normalizedClass, gender, guardianPhone, status });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-  res.status(404).json({ error: "Student not found" });
 });
 
 // DELETE Student
-app.delete("/api/students/:id", async (req, res) => {
+app.delete("/api/students/:id", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const { id } = req.params;
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { error } = await supabase.from("students").delete().eq("id", id).eq("user_id", tenantId);
-      if (!error) {
-        return res.json({ success: true, message: "Student deleted from Supabase" });
-      }
-      console.warn("Supabase delete error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase delete failed, falling back to local:", err);
+  try {
+    const { error } = await supabase.from("students").delete().eq("id", id).eq("user_id", tenantId);
+    if (error) {
+      return res.status(500).json({ error: `Supabase delete failed: ${error.message}` });
     }
+    return res.json({ success: true, message: "Student deleted from Supabase" });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-
-  const local = loadLocalData();
-  local.students = local.students.filter(s => !(s.id === id && (s.userId === tenantId || s.user_id === tenantId)));
-  // Clean fees and attendance matching this student belonging to this tenant
-  if (local.fees[id]) {
-    delete local.fees[id];
-  }
-  Object.keys(local.attendance).forEach(date => {
-    local.attendance[date] = local.attendance[date].filter(a => a.studentId !== id);
-  });
-  saveLocalData(local);
-  res.json({ success: true, message: "Student and all records deleted locally" });
 });
 
 // GET Attendance for a specific date and optional session
-app.get("/api/attendance", async (req, res) => {
+app.get("/api/attendance", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const rawDate = (req.query.date as string) || new Date().toISOString().split("T")[0];
   const session = (req.query.session as string) || "";
-  
-  // Combine date and session if session is provided to support multiple attendances per day
   const date = session ? `${rawDate}_${session}` : rawDate;
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase.from("attendance").select("*").eq("date", date).eq("user_id", tenantId);
-      if (!error) {
-        const mapped = (data || []).map((a: any) => ({
-          studentId: a.student_id,
-          status: a.status,
-          timestamp: a.timestamp
-        }));
-        return res.json(mapped);
-      }
-      console.warn("Supabase attendance fetch error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase attendance fetch failed, falling back to local:", err);
+  try {
+    const { data, error } = await supabase.from("attendance").select("*").eq("date", date).eq("user_id", tenantId);
+    if (error) {
+      return res.status(500).json({ error: `Supabase fetch failed: ${error.message}` });
     }
+    const mapped = (data || []).map((a: any) => ({
+      studentId: a.student_id,
+      status: a.status,
+      timestamp: a.timestamp
+    }));
+    return res.json(mapped);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-
-  const local = loadLocalData();
-  const dayRecords = local.attendance[date] || [];
-  const filtered = dayRecords.filter((a: any) => a.userId === tenantId || a.user_id === tenantId);
-  res.json(filtered);
 });
 
 // GET All Attendance (for reports)
-app.get("/api/attendance/all", async (req, res) => {
+app.get("/api/attendance/all", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase.from("attendance").select("*").eq("user_id", tenantId);
-      if (!error) {
-        // Group by date
-        const grouped: { [date: string]: any[] } = {};
-        (data || []).forEach((a: any) => {
-          if (!grouped[a.date]) grouped[a.date] = [];
-          grouped[a.date].push({
-            studentId: a.student_id,
-            status: a.status,
-            timestamp: a.timestamp
-          });
-        });
-        return res.json(grouped);
-      }
-      console.warn("Supabase all attendance error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase all attendance failed, falling back to local:", err);
+  try {
+    const { data, error } = await supabase.from("attendance").select("*").eq("user_id", tenantId);
+    if (error) {
+      return res.status(500).json({ error: `Supabase fetch failed: ${error.message}` });
     }
-  }
-
-  const local = loadLocalData();
-  const filteredGrouped: { [date: string]: any[] } = {};
-  Object.keys(local.attendance || {}).forEach(date => {
-    const list = local.attendance[date] || [];
-    const filteredList = list.filter((a: any) => a.userId === tenantId || a.user_id === tenantId);
-    if (filteredList.length > 0) {
-      filteredGrouped[date] = filteredList.map((a: any) => ({
-        studentId: a.studentId,
+    const grouped: { [date: string]: any[] } = {};
+    (data || []).forEach((a: any) => {
+      if (!grouped[a.date]) grouped[a.date] = [];
+      grouped[a.date].push({
+        studentId: a.student_id,
         status: a.status,
         timestamp: a.timestamp
-      }));
-    }
-  });
-  res.json(filteredGrouped);
+      });
+    });
+    return res.json(grouped);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
+  }
 });
 
 // POST Save Batch Attendance
-app.post("/api/attendance/batch", async (req, res) => {
+app.post("/api/attendance/batch", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
-  const { date: rawDate, session, records } = req.body; // records: [{ studentId, status }]
+  const { date: rawDate, session, records } = req.body;
   const timestamp = new Date().toISOString();
-
-  // Combine date and session to support taking attendance twice a day
   const date = session ? `${rawDate}_${session}` : rawDate;
 
-  // Deduplicate records array to prevent multiple entries for the same student on the same day
   const seenStudents = new Set<string>();
   const uniqueRecords: any[] = [];
   for (const r of (records || [])) {
@@ -836,178 +747,129 @@ app.post("/api/attendance/batch", async (req, res) => {
     }
   }
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      // First delete existing records for this date and tenant to overwrite cleanly
-      await supabase.from("attendance").delete().eq("date", date).eq("user_id", tenantId);
-      
-      const rows = uniqueRecords.map((r: any) => ({
-        id: `att-${date}-${r.studentId}-${Math.random().toString(36).substring(2, 6)}`,
-        user_id: tenantId,
-        date,
-        student_id: r.studentId,
-        status: r.status,
-        timestamp
-      }));
-
-      const { error } = await supabase.from("attendance").insert(rows);
-      if (!error) {
-        return res.json({ success: true, date, count: uniqueRecords.length });
-      }
-      console.warn("Supabase batch attendance insert error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase batch attendance failed, falling back to local:", err);
+  try {
+    // Delete existing cleanly first
+    const { error: delError } = await supabase.from("attendance").delete().eq("date", date).eq("user_id", tenantId);
+    if (delError) {
+      return res.status(500).json({ error: `Failed to reset attendance for this date: ${delError.message}` });
     }
+    
+    const rows = uniqueRecords.map((r: any) => ({
+      id: `att-${date}-${r.studentId}-${Math.random().toString(36).substring(2, 6)}`,
+      user_id: tenantId,
+      date,
+      student_id: r.studentId,
+      status: r.status,
+      timestamp
+    }));
+
+    if (rows.length > 0) {
+      const { error: insertError } = await supabase.from("attendance").insert(rows);
+      if (insertError) {
+        return res.status(500).json({ error: `Failed to save attendance: ${insertError.message}` });
+      }
+    }
+
+    return res.json({ success: true, date, count: uniqueRecords.length });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-
-  const local = loadLocalData();
-  const currentList = local.attendance[date] || [];
-  const otherTenantsList = currentList.filter((r: any) => r.userId !== tenantId && r.user_id !== tenantId);
-  
-  const newTenantList = uniqueRecords.map((r: any) => ({
-    studentId: r.studentId,
-    status: r.status,
-    timestamp,
-    userId: tenantId
-  }));
-
-  local.attendance[date] = [...otherTenantsList, ...newTenantList];
-  saveLocalData(local);
-  res.json({ success: true, date, count: uniqueRecords.length });
 });
 
 // GET Fees
-app.get("/api/fees", async (req, res) => {
+app.get("/api/fees", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase.from("fees").select("*").eq("user_id", tenantId);
-      if (!error) {
-        // Format to keyed object expected by frontend
-        const grouped: { [studentId: string]: any[] } = {};
-        (data || []).forEach((f: any) => {
-          if (!grouped[f.student_id]) grouped[f.student_id] = [];
-          grouped[f.student_id].push({
-            id: f.id,
-            month: f.month,
-            year: String(f.year),
-            amount: Number(f.amount),
-            paidAmount: Number(f.paid_amount),
-            status: f.status,
-            createdAt: f.created_at,
-            updatedAt: f.updated_at,
-            history: Array.isArray(f.history) ? f.history : (typeof f.history === 'string' ? JSON.parse(f.history) : [])
-          });
-        });
-        return res.json(grouped);
-      }
-      console.warn("Supabase fees query error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase fees failed, falling back to local:", err);
+  try {
+    const { data, error } = await supabase.from("fees").select("*").eq("user_id", tenantId);
+    if (error) {
+      return res.status(500).json({ error: `Supabase fetch failed: ${error.message}` });
     }
+    const grouped: { [studentId: string]: any[] } = {};
+    (data || []).forEach((f: any) => {
+      if (!grouped[f.student_id]) grouped[f.student_id] = [];
+      grouped[f.student_id].push({
+        id: f.id,
+        month: f.month,
+        year: String(f.year),
+        amount: Number(f.amount),
+        paidAmount: Number(f.paid_amount),
+        status: f.status,
+        createdAt: f.created_at,
+        updatedAt: f.updated_at,
+        history: Array.isArray(f.history) ? f.history : (typeof f.history === 'string' ? JSON.parse(f.history) : [])
+      });
+    });
+    return res.json(grouped);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-
-  const local = loadLocalData();
-  const tenantStudentIds = new Set(
-    (local.students || [])
-      .filter((s: any) => s.userId === tenantId || s.user_id === tenantId)
-      .map((s: any) => s.id)
-  );
-
-  const filteredFees: { [studentId: string]: any[] } = {};
-  Object.keys(local.fees || {}).forEach(studentId => {
-    if (tenantStudentIds.has(studentId)) {
-      filteredFees[studentId] = local.fees[studentId];
-    }
-  });
-
-  res.json(filteredFees);
 });
 
 // POST Fee Record
-app.post("/api/fees", async (req, res) => {
+app.post("/api/fees", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const { studentId, month, year, amount, paidAmount, status } = req.body;
   const fMonth = String(month || "").trim();
   const fYear = String(year || "").trim();
 
-  // Check for duplicate fee invoice
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data: existing, error: checkError } = await supabase
-        .from("fees")
-        .select("id")
-        .eq("user_id", tenantId)
-        .eq("student_id", studentId)
-        .eq("month", fMonth)
-        .eq("year", Number(fYear));
-      
-      if (!checkError && existing && existing.length > 0) {
-        return res.status(400).json({ error: `An invoice already exists for this student in ${fMonth} ${fYear}.` });
-      }
-    } catch (err) {
-      console.error("Supabase duplicate check for fee failed:", err);
+  try {
+    const { data: existing, error: checkError } = await supabase
+      .from("fees")
+      .select("id")
+      .eq("user_id", tenantId)
+      .eq("student_id", studentId)
+      .eq("month", fMonth)
+      .eq("year", Number(fYear));
+    
+    if (checkError) {
+      return res.status(500).json({ error: `Database check failed: ${checkError.message}` });
     }
-  }
-
-  const local = loadLocalData();
-  const studentFees = local.fees[studentId] || [];
-  const isDuplicate = studentFees.some((f: any) => 
-    f.month.toLowerCase() === fMonth.toLowerCase() &&
-    String(f.year) === fYear
-  );
-  if (isDuplicate) {
-    return res.status(400).json({ error: `An invoice already exists for this student in ${fMonth} ${fYear}.` });
-  }
-
-  const id = "f-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
-  const createdAt = new Date().toISOString();
-  
-  const newFee = {
-    id,
-    userId: tenantId,
-    month: fMonth,
-    year: fYear,
-    amount: Number(amount),
-    paidAmount: Number(paidAmount),
-    status,
-    createdAt,
-    updatedAt: createdAt,
-    history: [{ action: "created", amount: Number(amount), date: createdAt }]
-  };
-
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { error } = await supabase.from("fees").insert({
-        id,
-        user_id: tenantId,
-        student_id: studentId,
-        month: fMonth,
-        year: Number(fYear),
-        amount: Number(amount),
-        paid_amount: Number(paidAmount),
-        status,
-        created_at: createdAt,
-        updated_at: createdAt,
-        history: newFee.history
-      });
-      if (!error) {
-        return res.json(newFee);
-      }
-      console.warn("Supabase insert fee error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase insert fee failed, falling back to local:", err);
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: `An invoice already exists for this student in ${fMonth} ${fYear}.` });
     }
-  }
 
-  if (!local.fees[studentId]) local.fees[studentId] = [];
-  local.fees[studentId].push(newFee);
-  saveLocalData(local);
-  res.json(newFee);
+    const id = "f-" + Math.random().toString(36).substring(2, 11) + "-" + Date.now().toString(36);
+    const createdAt = new Date().toISOString();
+    
+    const newFee = {
+      id,
+      userId: tenantId,
+      month: fMonth,
+      year: fYear,
+      amount: Number(amount),
+      paidAmount: Number(paidAmount),
+      status,
+      createdAt,
+      updatedAt: createdAt,
+      history: [{ action: "created", amount: Number(amount), date: createdAt }]
+    };
+
+    const { error } = await supabase.from("fees").insert({
+      id,
+      user_id: tenantId,
+      student_id: studentId,
+      month: fMonth,
+      year: Number(fYear),
+      amount: Number(amount),
+      paid_amount: Number(paidAmount),
+      status,
+      created_at: createdAt,
+      updated_at: createdAt,
+      history: newFee.history
+    });
+
+    if (error) {
+      return res.status(500).json({ error: `Supabase insert failed: ${error.message}` });
+    }
+
+    return res.json(newFee);
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
+  }
 });
 
 // PUT Fee Record
-app.put("/api/fees/:studentId/:feeId", async (req, res) => {
+app.put("/api/fees/:studentId/:feeId", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const { studentId, feeId } = req.params;
   const { month, year, amount, paidAmount, status, actionDesc } = req.body;
@@ -1015,211 +877,142 @@ app.put("/api/fees/:studentId/:feeId", async (req, res) => {
   const fYear = String(year || "").trim();
   const updatedAt = new Date().toISOString();
 
-  // Check for duplicate fee invoice
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data: existing, error: checkError } = await supabase
-        .from("fees")
-        .select("id")
-        .eq("user_id", tenantId)
-        .eq("student_id", studentId)
-        .eq("month", fMonth)
-        .eq("year", Number(fYear))
-        .neq("id", feeId);
-      
-      if (!checkError && existing && existing.length > 0) {
-        return res.status(400).json({ error: `An invoice already exists for this student in ${fMonth} ${fYear}.` });
-      }
-    } catch (err) {
-      console.error("Supabase duplicate check for fee update failed:", err);
+  try {
+    const { data: existing, error: checkError } = await supabase
+      .from("fees")
+      .select("id")
+      .eq("user_id", tenantId)
+      .eq("student_id", studentId)
+      .eq("month", fMonth)
+      .eq("year", Number(fYear))
+      .neq("id", feeId);
+    
+    if (checkError) {
+      return res.status(500).json({ error: `Database check failed: ${checkError.message}` });
     }
-  }
-
-  const local = loadLocalData();
-  const studentFees = local.fees[studentId] || [];
-  const isDuplicate = studentFees.some((f: any) => 
-    f.id !== feeId &&
-    f.month.toLowerCase() === fMonth.toLowerCase() &&
-    String(f.year) === fYear
-  );
-  if (isDuplicate) {
-    return res.status(400).json({ error: `An invoice already exists for this student in ${fMonth} ${fYear}.` });
-  }
-
-  if (isSupabaseConfigured && supabase) {
-    try {
-      // To update history, first get the current invoice
-      const { data: existingFee } = await supabase.from("fees").select("history").eq("id", feeId).eq("user_id", tenantId).single();
-      let historyList = [];
-      if (existingFee && existingFee.history) {
-        historyList = Array.isArray(existingFee.history) ? existingFee.history : (typeof existingFee.history === 'string' ? JSON.parse(existingFee.history) : []);
-      }
-      historyList.push({
-        action: actionDesc || "edited",
-        amount: Number(amount),
-        date: updatedAt
-      });
-
-      const { error } = await supabase.from("fees").update({
-        month: fMonth,
-        year: Number(fYear),
-        amount: Number(amount),
-        paid_amount: Number(paidAmount),
-        status,
-        updated_at: updatedAt,
-        history: historyList
-      }).eq("id", feeId).eq("user_id", tenantId);
-
-      if (!error) {
-        return res.json({ id: feeId, month: fMonth, year: fYear, amount, paidAmount, status, updatedAt, history: historyList });
-      }
-      console.warn("Supabase update fee error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase update fee failed, falling back to local:", err);
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ error: `An invoice already exists for this student in ${fMonth} ${fYear}.` });
     }
-  }
 
-  if (local.fees[studentId]) {
-    const idx = local.fees[studentId].findIndex(f => f.id === feeId);
-    if (idx > -1) {
-      const current = local.fees[studentId][idx];
-      const historyList = [...(current.history || [])];
-      historyList.push({
-        action: actionDesc || "edited",
-        amount: Number(amount),
-        date: updatedAt
-      });
-
-      const updated = {
-        ...current,
-        month: fMonth,
-        year: fYear,
-        amount: Number(amount),
-        paidAmount: Number(paidAmount),
-        status,
-        updatedAt,
-        history: historyList
-      };
-
-      local.fees[studentId][idx] = updated;
-      saveLocalData(local);
-      return res.json(updated);
+    // Get current invoice history
+    const { data: existingFee, error: fetchError } = await supabase.from("fees").select("history").eq("id", feeId).eq("user_id", tenantId).single();
+    if (fetchError) {
+      return res.status(404).json({ error: "Fee record not found." });
     }
+
+    let historyList = [];
+    if (existingFee && existingFee.history) {
+      historyList = Array.isArray(existingFee.history) ? existingFee.history : (typeof existingFee.history === 'string' ? JSON.parse(existingFee.history) : []);
+    }
+    historyList.push({
+      action: actionDesc || "edited",
+      amount: Number(amount),
+      date: updatedAt
+    });
+
+    const { error } = await supabase.from("fees").update({
+      month: fMonth,
+      year: Number(fYear),
+      amount: Number(amount),
+      paid_amount: Number(paidAmount),
+      status,
+      updated_at: updatedAt,
+      history: historyList
+    }).eq("id", feeId).eq("user_id", tenantId);
+
+    if (error) {
+      return res.status(500).json({ error: `Supabase update failed: ${error.message}` });
+    }
+
+    return res.json({ id: feeId, month: fMonth, year: fYear, amount, paidAmount, status, updatedAt, history: historyList });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-  res.status(404).json({ error: "Fee record not found" });
 });
 
 // DELETE Fee Record
-app.delete("/api/fees/:studentId/:feeId", async (req, res) => {
+app.delete("/api/fees/:studentId/:feeId", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
-  const { studentId, feeId } = req.params;
+  const { feeId } = req.params;
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { error } = await supabase.from("fees").delete().eq("id", feeId).eq("user_id", tenantId);
-      if (!error) {
-        return res.json({ success: true });
-      }
-      console.warn("Supabase delete fee error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase delete fee failed, falling back to local:", err);
+  try {
+    const { error } = await supabase.from("fees").delete().eq("id", feeId).eq("user_id", tenantId);
+    if (error) {
+      return res.status(500).json({ error: `Supabase delete failed: ${error.message}` });
     }
-  }
-
-  const local = loadLocalData();
-  if (local.fees[studentId]) {
-    local.fees[studentId] = local.fees[studentId].filter(f => f.id !== feeId);
-    saveLocalData(local);
     return res.json({ success: true });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-  res.status(404).json({ error: "Fee record not found" });
 });
 
 // GET Settings
-app.get("/api/settings", async (req, res) => {
+app.get("/api/settings", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { data, error } = await supabase.from("settings").select("*").eq("id", tenantId).maybeSingle();
-      if (!error && data) {
-        return res.json({
-          schoolName: data.school_name,
-          currency: data.currency,
-          feeAmount: Number(data.fee_amount),
-          attendanceRules: data.attendance_rules,
-          systemTheme: data.system_theme
-        });
-      }
-      
-      // If query succeeded but no record yet, seed default record and return
-      if (!error) {
-        const defaultSettings = {
-          id: tenantId,
-          school_name: "School Pro 2026",
-          currency: "USD",
-          fee_amount: 50,
-          attendance_rules: "Strict",
-          system_theme: "light"
-        };
-        await supabase.from("settings").insert(defaultSettings);
-        return res.json({
-          schoolName: defaultSettings.school_name,
-          currency: defaultSettings.currency,
-          feeAmount: defaultSettings.fee_amount,
-          attendanceRules: defaultSettings.attendance_rules,
-          systemTheme: defaultSettings.system_theme
-        });
-      }
-      console.warn("Supabase settings error or missing default settings row, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase settings failed, falling back to local:", err);
+  try {
+    const { data, error } = await supabase.from("settings").select("*").eq("id", tenantId).maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: `Supabase query error: ${error.message}` });
     }
-  }
-
-  const local = loadLocalData();
-  if (!local.schoolSettings) local.schoolSettings = {};
-  if (!local.schoolSettings[tenantId]) {
-    local.schoolSettings[tenantId] = {
-      schoolName: local.settings?.schoolName || "School Pro 2026",
-      currency: local.settings?.currency || "USD",
-      feeAmount: local.settings?.feeAmount || 50,
-      attendanceRules: local.settings?.attendanceRules || "Strict",
-      systemTheme: local.settings?.systemTheme || "light"
+    if (data) {
+      return res.json({
+        schoolName: data.school_name,
+        currency: data.currency,
+        feeAmount: Number(data.fee_amount),
+        attendanceRules: data.attendance_rules,
+        systemTheme: data.system_theme
+      });
+    }
+    
+    // Seed and return default if not exists
+    const defaultSettings = {
+      id: tenantId,
+      school_name: "School Pro 2026",
+      currency: "USD",
+      fee_amount: 50,
+      attendance_rules: "Strict",
+      system_theme: "light"
     };
-    saveLocalData(local);
+    const { error: insertError } = await supabase.from("settings").insert(defaultSettings);
+    if (insertError) {
+      return res.status(500).json({ error: `Failed to seed settings: ${insertError.message}` });
+    }
+
+    return res.json({
+      schoolName: defaultSettings.school_name,
+      currency: defaultSettings.currency,
+      feeAmount: defaultSettings.fee_amount,
+      attendanceRules: defaultSettings.attendance_rules,
+      systemTheme: defaultSettings.system_theme
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
   }
-  res.json(local.schoolSettings[tenantId]);
 });
 
 // POST/PUT Settings
-app.post("/api/settings", async (req, res) => {
+app.post("/api/settings", requireOnlineDatabase, async (req, res) => {
   const tenantId = getTenantId(req);
   const { schoolName, currency, feeAmount, attendanceRules, systemTheme } = req.body;
 
-  if (isSupabaseConfigured && supabase) {
-    try {
-      const { error } = await supabase.from("settings").upsert({
-        id: tenantId,
-        school_name: schoolName,
-        currency,
-        fee_amount: Number(feeAmount),
-        attendance_rules: attendanceRules,
-        system_theme: systemTheme
-      });
-      if (!error) {
-        return res.json({ schoolName, currency, feeAmount, attendanceRules, systemTheme });
-      }
-      console.warn("Supabase upsert settings error, falling back to local:", error);
-    } catch (err) {
-      console.error("Supabase upsert settings failed, falling back to local:", err);
-    }
-  }
+  try {
+    const { error } = await supabase.from("settings").upsert({
+      id: tenantId,
+      school_name: schoolName,
+      currency,
+      fee_amount: Number(feeAmount),
+      attendance_rules: attendanceRules,
+      system_theme: systemTheme
+    });
 
-  const local = loadLocalData();
-  if (!local.schoolSettings) local.schoolSettings = {};
-  local.schoolSettings[tenantId] = { schoolName, currency, feeAmount, attendanceRules, systemTheme };
-  saveLocalData(local);
-  res.json(local.schoolSettings[tenantId]);
+    if (error) {
+      return res.status(500).json({ error: `Supabase update settings failed: ${error.message}` });
+    }
+
+    return res.json({ schoolName, currency, feeAmount, attendanceRules, systemTheme });
+  } catch (err: any) {
+    return res.status(500).json({ error: `Database error: ${err.message || err}` });
+  }
 });
 
 // POST Send Test SMTP Email
