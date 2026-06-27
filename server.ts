@@ -363,83 +363,108 @@ function isValidEmailAddress(email: string): boolean {
 
 // POST Send OTP
 app.post("/api/auth/send-otp", requireOnlineDatabase, async (req, res) => {
-  const { email, password, name, mode } = req.body;
-  
-  if (!email || !password || !mode) {
-    return res.status(400).json({ error: "Email, password, and mode are required!" });
-  }
-
-  const searchEmail = email.trim().toLowerCase();
-
-  // Validate email format
-  if (!isValidEmailAddress(searchEmail) && searchEmail !== "admin") {
-    return res.status(400).json({ error: "Fadlan geli email sax ah! / Please enter a valid email address!" });
-  }
-
-  // Check user existence in Supabase
-  let userExists = false;
-  let correctPassword = false;
-  let existingUser: any = null;
-
   try {
-    const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
-    if (error) {
-      return res.status(500).json({ error: `Supabase database error: ${error.message}` });
+    // 1. Check if body exists
+    if (!req.body) {
+      return res.status(400).json({ error: "Codsiga wuxuu u baahan yahay body! / Request body is required!" });
     }
-    if (data) {
+
+    const { email, password, name, mode } = req.body;
+    
+    if (!email || !password || !mode) {
+      return res.status(400).json({ error: "Email, password, iyo mode waa muhiim! / Email, password, and mode are required!" });
+    }
+
+    if (typeof email !== "string" || typeof password !== "string" || typeof mode !== "string") {
+      return res.status(400).json({ error: "Nooca macluumaadka la soo diray waa khalad! / Invalid request parameters format!" });
+    }
+
+    const searchEmail = email.trim().toLowerCase();
+
+    // Validate email format
+    if (!isValidEmailAddress(searchEmail) && searchEmail !== "admin") {
+      return res.status(400).json({ error: "Fadlan geli email sax ah! / Please enter a valid email address!" });
+    }
+
+    // Check user existence in Supabase
+    let userExists = false;
+    let correctPassword = false;
+    let existingUser: any = null;
+
+    try {
+      const { data, error } = await supabase.from("users").select("*").eq("email", searchEmail).maybeSingle();
+      if (error) {
+        return res.status(500).json({ error: `Supabase database error: ${error.message}` });
+      }
+      if (data) {
+        userExists = true;
+        existingUser = data;
+        correctPassword = data.password === password;
+      }
+    } catch (err: any) {
+      return res.status(500).json({ error: `Supabase request failed: ${err.message || err}` });
+    }
+
+    // Special Admin check for development/demo (if they want an admin option)
+    if (!userExists && (searchEmail === "admin" || searchEmail === "admin@dugsiga.com")) {
       userExists = true;
-      existingUser = data;
-      correctPassword = data.password === password;
+      correctPassword = password === "123";
+      existingUser = { id: "admin", email: "admin@dugsiga.com", name: "Admin", password: "123" };
     }
-  } catch (err: any) {
-    return res.status(500).json({ error: `Supabase request failed: ${err.message || err}` });
+
+    // Validation based on mode
+    if (mode === "signup") {
+      if (userExists) {
+        return res.status(400).json({ error: "Email-kan mar horey ayaa loo diiwaangeliyey! / This email is already registered!" });
+      }
+    } else if (mode === "login") {
+      if (!userExists) {
+        return res.status(400).json({ error: "Email-kan ma diiwaangashna! / No user registered with this email!" });
+      }
+      if (!correctPassword) {
+        return res.status(400).json({ error: "Erayga sirta ah waa khalad! / Incorrect password!" });
+      }
+    } else {
+      return res.status(400).json({ error: "Nooca habka xaqiijinta waa khalad! / Invalid auth mode specified!" });
+    }
+
+    // Generate 6-digit OTP code
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+
+    otpStore.set(searchEmail, {
+      otp,
+      password,
+      name: name && typeof name === "string" ? name.trim() : (existingUser ? existingUser.name : ""),
+      expiresAt,
+      mode: mode as "login" | "signup"
+    });
+
+    // Send email
+    let emailResult: { sent: boolean; error?: string } = { sent: false, error: "" };
+    try {
+      emailResult = await sendOtpEmail(searchEmail, otp, mode as "login" | "signup", name);
+    } catch (mailErr: any) {
+      console.error("Failed to execute sendOtpEmail helper:", mailErr);
+      emailResult = { sent: false, error: mailErr.message || "Email sending library error" };
+    }
+
+    const smtpConfigured = emailResult.sent;
+
+    return res.json({
+      success: true,
+      message: smtpConfigured 
+        ? "Code-ka xaqiijinta ayaa loo diray emailkaaga! / Verification code sent to your email!" 
+        : "Code-ka xaqiijinta ayaa la soo saaray! (Habka tijaabada) / Verification code generated! (Dev mode)",
+      smtpConfigured,
+      devOtp: smtpConfigured ? undefined : otp
+    });
+  } catch (error: any) {
+    console.error("CRITICAL unhandled error in send-otp handler:", error);
+    return res.status(500).json({
+      error: `Server error: ${error.message || "An unexpected error occurred during OTP generation."}`
+    });
   }
-
-  // Special Admin check for development/demo (if they want an admin option)
-  if (!userExists && (searchEmail === "admin" || searchEmail === "admin@dugsiga.com")) {
-    userExists = true;
-    correctPassword = password === "123";
-    existingUser = { id: "admin", email: "admin@dugsiga.com", name: "Admin", password: "123" };
-  }
-
-  // Validation based on mode
-  if (mode === "signup") {
-    if (userExists) {
-      return res.status(400).json({ error: "Email-kan mar horey ayaa loo diiwaangeliyey! / This email is already registered!" });
-    }
-  } else if (mode === "login") {
-    if (!userExists) {
-      return res.status(400).json({ error: "Email-kan ma diiwaangashna! / No user registered with this email!" });
-    }
-    if (!correctPassword) {
-      return res.status(400).json({ error: "Erayga sirta ah waa khalad! / Incorrect password!" });
-    }
-  }
-
-  // Generate 6-digit OTP code
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-
-  otpStore.set(searchEmail, {
-    otp,
-    password,
-    name: name ? name.trim() : (existingUser ? existingUser.name : ""),
-    expiresAt,
-    mode
-  });
-
-  // Send email
-  const emailResult = await sendOtpEmail(searchEmail, otp, mode, name);
-  const smtpConfigured = emailResult.sent;
-
-  res.json({
-    success: true,
-    message: smtpConfigured 
-      ? "Code-ka xaqiijinta ayaa loo diray emailkaaga! / Verification code sent to your email!" 
-      : "Code-ka xaqiijinta ayaa la soo saaray! (Habka tijaabada) / Verification code generated! (Dev mode)",
-    smtpConfigured,
-    devOtp: smtpConfigured ? undefined : otp
-  });
 });
 
 // POST Verify OTP and complete Auth
@@ -1065,6 +1090,14 @@ app.post("/api/settings/test-email", async (req, res) => {
     console.error("Test SMTP failed:", err);
     res.status(500).json({ error: err.message || "Failed to send SMTP email." });
   }
+});
+
+// Global error handling middleware to guarantee Express always returns valid JSON instead of HTML on unhandled exceptions
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("Unhandled express route error:", err);
+  res.status(500).json({
+    error: `A server error occurred: ${err.message || "Unknown error"}`
+  });
 });
 
 // Vite middleware setup for Development vs Production
